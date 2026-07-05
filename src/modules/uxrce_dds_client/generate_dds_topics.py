@@ -98,6 +98,14 @@ def process_message_type(msg_type):
     msg_type['dds_type'] = msg_type['type'].replace("::msg::", "::msg::dds_::") + "_"
     # topic_simple: eg vehicle_status
     msg_type['topic_simple'] = msg_type['topic'].split('/')[-1]
+    # rate_limit is configured in Hz in dds_topics.yaml. Keep the historical
+    # 10 ms default when a topic does not specify an explicit rate.
+    rate_limit_hz = msg_type.get('rate_limit')
+
+    if rate_limit_hz is None:
+        msg_type['rate_limit_interval_ms'] = 10
+    else:
+        msg_type['rate_limit_interval_ms'] = max(1, int(round(1000.0 / float(rate_limit_hz))))
 
 pubs_not_empty = msg_map['publications'] is not None
 if pubs_not_empty:
