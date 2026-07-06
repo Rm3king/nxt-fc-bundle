@@ -123,6 +123,8 @@ set(msg_files
 	HomePosition.msg
 	HoverThrustEstimate.msg
 	InputRc.msg
+	IndiSetpoint.msg
+	IndiStatus.msg
 	InternalCombustionEngineStatus.msg
 	IridiumsbdStatus.msg
 	IrlockReport.msg
@@ -174,6 +176,7 @@ set(msg_files
 	QshellReq.msg
 	QshellRetval.msg
 	RadioStatus.msg
+	RateCtrlCompensation.msg
 	RateCtrlStatus.msg
 	RcChannels.msg
 	RcParameterMap.msg

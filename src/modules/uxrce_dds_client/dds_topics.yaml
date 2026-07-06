@@ -64,6 +64,10 @@ publications:
     type: px4_msgs::msg::VehicleStatus
     rate_limit: 5.
 
+  - topic: /fmu/out/indi_status
+    type: px4_msgs::msg::IndiStatus
+    rate_limit: 100.
+
 # Create uORB::Publication
 subscriptions:
   - topic: /fmu/in/register_ext_component_request
@@ -119,6 +123,12 @@ subscriptions:
 
   - topic: /fmu/in/vehicle_rates_setpoint
     type: px4_msgs::msg::VehicleRatesSetpoint
+
+  - topic: /fmu/in/indi_setpoint
+    type: px4_msgs::msg::IndiSetpoint
+
+  - topic: /fmu/in/rate_ctrl_compensation
+    type: px4_msgs::msg::RateCtrlCompensation
 
   - topic: /fmu/in/differential_drive_setpoint
     type: px4_msgs::msg::DifferentialDriveSetpoint

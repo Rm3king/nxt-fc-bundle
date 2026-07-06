@@ -292,3 +292,423 @@ PARAM_DEFINE_FLOAT(MC_YAWRATE_K, 1.0f);
  * @group Multicopter Rate Control
  */
 PARAM_DEFINE_INT32(MC_BAT_SCALE_EN, 0);
+
+/**
+ * Multicopter rate controller mode
+ *
+ * Selects the low-level multicopter rate controller. The default keeps the
+ * stock PX4 PID controller unchanged.
+ *
+ * @value 0 PID
+ * @value 1 INDI
+ * @min 0
+ * @max 1
+ * @group Multicopter INDI Control
+ */
+PARAM_DEFINE_INT32(MC_INDI_MODE, 0);
+
+/**
+ * Restrict INDI to Offboard mode
+ *
+ * When enabled, INDI is only allowed while offboard control is active. Outside
+ * Offboard the controller falls back to the stock PID path.
+ *
+ * @boolean
+ * @group Multicopter INDI Control
+ */
+PARAM_DEFINE_INT32(MC_INDI_ONLY_OF, 1);
+
+/**
+ * INDI setpoint adapter mode
+ *
+ * Selects the setpoint frontend feeding the shared physical INDI core.
+ *
+ * @value 0 Acceleration + heading + body-rate feedforward
+ * @value 1 Collective thrust + body-rate compatibility path
+ * @min 0
+ * @max 1
+ * @group Multicopter INDI Control
+ */
+PARAM_DEFINE_INT32(MC_INDI_SP_MODE, 0);
+
+/**
+ * INDI setpoint timeout
+ *
+ * Timeout for the accel-heading INDI setpoint stream. When stale, INDI falls
+ * back to PID instead of latching the last setpoint.
+ *
+ * @unit ms
+ * @min 10
+ * @max 1000
+ * @group Multicopter INDI Control
+ */
+PARAM_DEFINE_INT32(MC_INDI_SP_TO, 100);
+
+/**
+ * Vehicle mass for INDI accel-heading frontend
+ *
+ * Used for logging and future physical thrust conversion. The current PX4
+ * normalized thrust adapter uses hover thrust for the final normalized command.
+ *
+ * @unit kg
+ * @min 0.05
+ * @max 20.0
+ * @decimal 3
+ * @group Multicopter INDI Control
+ */
+PARAM_DEFINE_FLOAT(MC_INDI_MASS, 1.0f);
+
+/**
+ * Hover thrust for INDI accel-heading frontend
+ *
+ * Normalized collective thrust magnitude that approximately hovers the vehicle.
+ *
+ * @min 0.05
+ * @max 0.95
+ * @decimal 3
+ * @group Multicopter INDI Control
+ */
+PARAM_DEFINE_FLOAT(MC_INDI_HOV_THR, 0.5f);
+
+/**
+ * INDI synchronized filter cutoff
+ *
+ * First-order low-pass cutoff used identically in mc_rate_control for
+ * locally differentiated body-rate angular acceleration and applied-torque
+ * estimate. This keeps omega_dot and tau0 on the same controller frame and
+ * filter coefficient.
+ *
+ * @unit Hz
+ * @min 1
+ * @max 200
+ * @decimal 1
+ * @group Multicopter INDI Control
+ */
+PARAM_DEFINE_FLOAT(MC_INDI_FILT, 40.0f);
+
+/**
+ * INDI roll inertia
+ *
+ * Physical or equivalent roll inertia used by the INDI core.
+ *
+ * @unit kg m^2
+ * @min 0.00001
+ * @max 1.0
+ * @decimal 5
+ * @group Multicopter INDI Control
+ */
+PARAM_DEFINE_FLOAT(MC_INDI_JX, 0.0020f);
+
+/**
+ * INDI pitch inertia
+ *
+ * Physical or equivalent pitch inertia used by the INDI core.
+ *
+ * @unit kg m^2
+ * @min 0.00001
+ * @max 1.0
+ * @decimal 5
+ * @group Multicopter INDI Control
+ */
+PARAM_DEFINE_FLOAT(MC_INDI_JY, 0.0020f);
+
+/**
+ * INDI yaw inertia
+ *
+ * Physical or equivalent yaw inertia used by the INDI core.
+ *
+ * @unit kg m^2
+ * @min 0.00001
+ * @max 1.0
+ * @decimal 5
+ * @group Multicopter INDI Control
+ */
+PARAM_DEFINE_FLOAT(MC_INDI_JZ, 0.0040f);
+
+/**
+ * INDI roll torque normalization scale
+ *
+ * Physical roll torque that maps to normalized torque command 1.0.
+ *
+ * @unit Nm
+ * @min 0.0001
+ * @max 10.0
+ * @decimal 4
+ * @group Multicopter INDI Control
+ */
+PARAM_DEFINE_FLOAT(MC_INDI_TMAX_X, 0.05f);
+
+/**
+ * INDI pitch torque normalization scale
+ *
+ * Physical pitch torque that maps to normalized torque command 1.0.
+ *
+ * @unit Nm
+ * @min 0.0001
+ * @max 10.0
+ * @decimal 4
+ * @group Multicopter INDI Control
+ */
+PARAM_DEFINE_FLOAT(MC_INDI_TMAX_Y, 0.05f);
+
+/**
+ * INDI yaw torque normalization scale
+ *
+ * Physical yaw torque that maps to normalized torque command 1.0.
+ *
+ * @unit Nm
+ * @min 0.0001
+ * @max 10.0
+ * @decimal 4
+ * @group Multicopter INDI Control
+ */
+PARAM_DEFINE_FLOAT(MC_INDI_TMAX_Z, 0.02f);
+
+/**
+ * INDI roll attitude frontend gain
+ *
+ * Maps accel-heading attitude error to body-rate setpoint.
+ *
+ * @unit 1/s
+ * @min 0
+ * @max 20
+ * @decimal 2
+ * @group Multicopter INDI Control
+ */
+PARAM_DEFINE_FLOAT(MC_INDI_AKP_X, 4.0f);
+
+/**
+ * INDI pitch attitude frontend gain
+ *
+ * Maps accel-heading attitude error to body-rate setpoint.
+ *
+ * @unit 1/s
+ * @min 0
+ * @max 20
+ * @decimal 2
+ * @group Multicopter INDI Control
+ */
+PARAM_DEFINE_FLOAT(MC_INDI_AKP_Y, 4.0f);
+
+/**
+ * INDI yaw attitude frontend gain
+ *
+ * Maps accel-heading attitude error to body-rate setpoint.
+ *
+ * @unit 1/s
+ * @min 0
+ * @max 20
+ * @decimal 2
+ * @group Multicopter INDI Control
+ */
+PARAM_DEFINE_FLOAT(MC_INDI_AKP_Z, 2.0f);
+
+/**
+ * INDI attitude yaw weight
+ *
+ * Yaw deprioritization weight for the accel-heading frontend.
+ *
+ * @min 0
+ * @max 1
+ * @decimal 2
+ * @group Multicopter INDI Control
+ */
+PARAM_DEFINE_FLOAT(MC_INDI_YAW_W, 0.4f);
+
+/**
+ * INDI roll rate-to-acceleration gain
+ *
+ * Maps body-rate error to desired roll angular acceleration.
+ *
+ * @unit 1/s
+ * @min 0
+ * @max 200
+ * @decimal 2
+ * @group Multicopter INDI Control
+ */
+PARAM_DEFINE_FLOAT(MC_INDI_RKP_X, 25.0f);
+
+/**
+ * INDI pitch rate-to-acceleration gain
+ *
+ * Maps body-rate error to desired pitch angular acceleration.
+ *
+ * @unit 1/s
+ * @min 0
+ * @max 200
+ * @decimal 2
+ * @group Multicopter INDI Control
+ */
+PARAM_DEFINE_FLOAT(MC_INDI_RKP_Y, 25.0f);
+
+/**
+ * INDI yaw rate-to-acceleration gain
+ *
+ * Maps body-rate error to desired yaw angular acceleration.
+ *
+ * @unit 1/s
+ * @min 0
+ * @max 200
+ * @decimal 2
+ * @group Multicopter INDI Control
+ */
+PARAM_DEFINE_FLOAT(MC_INDI_RKP_Z, 15.0f);
+
+/**
+ * INDI roll angular acceleration limit
+ *
+ * @unit rad/s^2
+ * @min 1
+ * @max 5000
+ * @decimal 1
+ * @group Multicopter INDI Control
+ */
+PARAM_DEFINE_FLOAT(MC_INDI_NLIM_X, 400.0f);
+
+/**
+ * INDI pitch angular acceleration limit
+ *
+ * @unit rad/s^2
+ * @min 1
+ * @max 5000
+ * @decimal 1
+ * @group Multicopter INDI Control
+ */
+PARAM_DEFINE_FLOAT(MC_INDI_NLIM_Y, 400.0f);
+
+/**
+ * INDI yaw angular acceleration limit
+ *
+ * @unit rad/s^2
+ * @min 1
+ * @max 5000
+ * @decimal 1
+ * @group Multicopter INDI Control
+ */
+PARAM_DEFINE_FLOAT(MC_INDI_NLIM_Z, 200.0f);
+
+/**
+ * INDI roll normalized torque limit
+ *
+ * @min 0
+ * @max 1
+ * @decimal 3
+ * @group Multicopter INDI Control
+ */
+PARAM_DEFINE_FLOAT(MC_INDI_TLIM_X, 1.0f);
+
+/**
+ * INDI pitch normalized torque limit
+ *
+ * @min 0
+ * @max 1
+ * @decimal 3
+ * @group Multicopter INDI Control
+ */
+PARAM_DEFINE_FLOAT(MC_INDI_TLIM_Y, 1.0f);
+
+/**
+ * INDI yaw normalized torque limit
+ *
+ * @min 0
+ * @max 1
+ * @decimal 3
+ * @group Multicopter INDI Control
+ */
+PARAM_DEFINE_FLOAT(MC_INDI_TLIM_Z, 1.0f);
+
+/**
+ * INDI roll normalized torque slew rate
+ *
+ * Limits the change rate of the final normalized roll torque command. Set to
+ * zero to disable slew limiting.
+ *
+ * @unit 1/s
+ * @min 0
+ * @max 1000
+ * @decimal 1
+ * @group Multicopter INDI Control
+ */
+PARAM_DEFINE_FLOAT(MC_INDI_SLEW_X, 0.0f);
+
+/**
+ * INDI pitch normalized torque slew rate
+ *
+ * Limits the change rate of the final normalized pitch torque command. Set to
+ * zero to disable slew limiting.
+ *
+ * @unit 1/s
+ * @min 0
+ * @max 1000
+ * @decimal 1
+ * @group Multicopter INDI Control
+ */
+PARAM_DEFINE_FLOAT(MC_INDI_SLEW_Y, 0.0f);
+
+/**
+ * INDI yaw normalized torque slew rate
+ *
+ * Limits the change rate of the final normalized yaw torque command. Set to
+ * zero to disable slew limiting.
+ *
+ * @unit 1/s
+ * @min 0
+ * @max 1000
+ * @decimal 1
+ * @group Multicopter INDI Control
+ */
+PARAM_DEFINE_FLOAT(MC_INDI_SLEW_Z, 0.0f);
+
+/**
+ * INDI actuator state source
+ *
+ * Selects the applied-torque estimate source. Output and RPM paths are reserved
+ * for follow-up implementation; the command model is currently used as fallback.
+ *
+ * @value 0 First-order command model
+ * @value 1 Actuator outputs, fallback to command model
+ * @value 2 ESC RPM, fallback to command model
+ * @min 0
+ * @max 2
+ * @group Multicopter INDI Control
+ */
+PARAM_DEFINE_INT32(MC_INDI_ACT_SRC, 0);
+
+/**
+ * INDI actuator model time constant
+ *
+ * First-order motor/actuator time constant used for applied torque estimate.
+ *
+ * @unit s
+ * @min 0.001
+ * @max 0.5
+ * @decimal 3
+ * @group Multicopter INDI Control
+ */
+PARAM_DEFINE_FLOAT(MC_INDI_MOT_TC, 0.04f);
+
+/**
+ * INDI compensation enable bitmask
+ *
+ * Bit 0 enables angular acceleration compensation, bit 1 enables physical
+ * torque compensation.
+ *
+ * @bit 0 angular acceleration compensation
+ * @bit 1 torque compensation
+ * @min 0
+ * @max 3
+ * @group Multicopter INDI Control
+ */
+PARAM_DEFINE_INT32(MC_INDI_COMP_EN, 0);
+
+/**
+ * INDI compensation timeout
+ *
+ * Timeout for the onboard compensation stream.
+ *
+ * @unit ms
+ * @min 5
+ * @max 1000
+ * @group Multicopter INDI Control
+ */
+PARAM_DEFINE_INT32(MC_INDI_COMP_TO, 50);
