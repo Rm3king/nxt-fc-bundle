@@ -436,7 +436,7 @@ PARAM_DEFINE_FLOAT(MC_INDI_JZ, 0.0040f);
  * @decimal 4
  * @group Multicopter INDI Control
  */
-PARAM_DEFINE_FLOAT(MC_INDI_TMAX_X, 0.05f);
+PARAM_DEFINE_FLOAT(MC_INDI_TMAX_X, 0.10f);
 
 /**
  * INDI pitch torque normalization scale
@@ -449,7 +449,7 @@ PARAM_DEFINE_FLOAT(MC_INDI_TMAX_X, 0.05f);
  * @decimal 4
  * @group Multicopter INDI Control
  */
-PARAM_DEFINE_FLOAT(MC_INDI_TMAX_Y, 0.05f);
+PARAM_DEFINE_FLOAT(MC_INDI_TMAX_Y, 0.10f);
 
 /**
  * INDI yaw torque normalization scale
@@ -462,7 +462,7 @@ PARAM_DEFINE_FLOAT(MC_INDI_TMAX_Y, 0.05f);
  * @decimal 4
  * @group Multicopter INDI Control
  */
-PARAM_DEFINE_FLOAT(MC_INDI_TMAX_Z, 0.02f);
+PARAM_DEFINE_FLOAT(MC_INDI_TMAX_Z, 0.03f);
 
 /**
  * INDI roll attitude frontend gain

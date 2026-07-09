@@ -144,6 +144,8 @@ private:
 	vehicle_attitude_s	_vehicle_attitude{};
 	indi_setpoint_s		_indi_setpoint{};
 	rate_ctrl_compensation_s _rate_ctrl_compensation{};
+	hrt_abstime _indi_setpoint_rx_time{0};
+	hrt_abstime _rate_ctrl_compensation_rx_time{0};
 
 	bool _landed{true};
 	bool _maybe_landed{true};

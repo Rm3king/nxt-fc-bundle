@@ -164,12 +164,13 @@ MulticopterRateControl::updateAccelHeadingFrontend(const Quatf &q, Vector3f &rat
 {
 	if (_indi_setpoint_sub.updated()) {
 		_indi_setpoint_sub.copy(&_indi_setpoint);
+		_indi_setpoint_rx_time = hrt_absolute_time();
 	}
 
 	const hrt_abstime now = hrt_absolute_time();
 	const uint64_t setpoint_timeout_us = (uint64_t)math::max(_param_mc_indi_sp_to.get(), (int32_t)10) * 1000ULL;
 
-	if (!_indi_setpoint.valid || _indi_setpoint.timestamp == 0 || now - _indi_setpoint.timestamp > setpoint_timeout_us) {
+	if (!_indi_setpoint.valid || _indi_setpoint_rx_time == 0 || now - _indi_setpoint_rx_time > setpoint_timeout_us) {
 		return false;
 	}
 
@@ -332,12 +333,13 @@ MulticopterRateControl::updateIndiControl(const Vector3f &rates, const Vector3f 
 
 	if (_rate_ctrl_compensation_sub.updated()) {
 		_rate_ctrl_compensation_sub.copy(&_rate_ctrl_compensation);
+		_rate_ctrl_compensation_rx_time = hrt_absolute_time();
 	}
 
 	const hrt_abstime now = hrt_absolute_time();
 	const uint64_t comp_timeout_us = (uint64_t)math::max(_param_mc_indi_comp_to.get(), (int32_t)5) * 1000ULL;
-	const bool comp_fresh = _rate_ctrl_compensation.valid && _rate_ctrl_compensation.timestamp != 0
-				&& now - _rate_ctrl_compensation.timestamp <= comp_timeout_us;
+	const bool comp_fresh = _rate_ctrl_compensation.valid && _rate_ctrl_compensation_rx_time != 0
+				&& now - _rate_ctrl_compensation_rx_time <= comp_timeout_us;
 
 	if (comp_fresh) {
 		const int32_t comp_enable = _param_mc_indi_comp_en.get();
@@ -372,7 +374,11 @@ MulticopterRateControl::updateIndiControl(const Vector3f &rates, const Vector3f 
 
 		nu_comp(i) = nu_comp_limited;
 
-		const float tau_comp_limit = math::max(_indi_torque_max(i) * _indi_torque_norm_limit(i), 0.0001f);
+		// The compensation stream is already limited on the companion side.
+		// Keep PX4's own pre-limit deliberately high so it does not mask
+		// direction tests; the final normalized actuator limit below still
+		// protects the actual torque setpoint.
+		const float tau_comp_limit = 10.0f;
 		const float tau_comp_limited = math::constrain(tau_comp(i), -tau_comp_limit, tau_comp_limit);
 
 		if (fabsf(tau_comp_limited - tau_comp(i)) > 1e-5f) {
