@@ -294,15 +294,133 @@ PARAM_DEFINE_FLOAT(MC_YAWRATE_K, 1.0f);
 PARAM_DEFINE_INT32(MC_BAT_SCALE_EN, 0);
 
 /**
+ * Rate system-identification AUX channel
+ *
+ * Selects the AUX input used to start the one-shot PID identification sequence.
+ * Move the selected switch low once after boot, then move and hold it high while
+ * flying to run settle, roll, pitch, and yaw sweeps. Moving it low, moving a
+ * stick, or violating a safety guard aborts immediately. Zero disables the
+ * feature. Identification is allowed only with MC_INDI_MODE=0.
+ *
+ * @value 0 Disabled
+ * @value 1 AUX1
+ * @value 2 AUX2
+ * @value 3 AUX3
+ * @value 4 AUX4
+ * @value 5 AUX5
+ * @value 6 AUX6
+ * @min 0
+ * @max 6
+ * @group Multicopter Rate System Identification
+ */
+PARAM_DEFINE_INT32(MC_RSYSID_AUX, 0);
+
+/**
+ * Rate identification excitation mode
+ *
+ * Rate chirp is retained for rate-loop checks. Torque chirp and periodic
+ * multisine are injected after the stock PID and are preferred for B1/B2
+ * control-effectiveness identification.
+ *
+ * @value 0 Rate-setpoint logarithmic chirp
+ * @value 1 Normalized-torque logarithmic chirp
+ * @value 2 Normalized-torque periodic multisine
+ * @min 0
+ * @max 2
+ * @group Multicopter Rate System Identification
+ */
+PARAM_DEFINE_INT32(MC_RSYSID_MODE, 0);
+
+/**
+ * Rate identification signal amplitude
+ *
+ * Peak body-rate setpoint added immediately before the stock PID rate
+ * controller. Keep this small for the first flight.
+ *
+ * @unit rad/s
+ * @min 0.01
+ * @max 0.30
+ * @decimal 3
+ * @group Multicopter Rate System Identification
+ */
+PARAM_DEFINE_FLOAT(MC_RSYSID_AMP, 0.04f);
+
+/**
+ * Rate identification normalized torque amplitude
+ *
+ * Peak additive torque used by torque chirp and multisine modes. The signal is
+ * added after the stock PID and before the control allocator.
+ *
+ * @min 0.001
+ * @max 0.10
+ * @decimal 3
+ * @group Multicopter Rate System Identification
+ */
+PARAM_DEFINE_FLOAT(MC_RSYSID_TAMP, 0.02f);
+
+/**
+ * Rate identification start frequency
+ *
+ * @unit Hz
+ * @min 0.2
+ * @max 5.0
+ * @decimal 2
+ * @group Multicopter Rate System Identification
+ */
+PARAM_DEFINE_FLOAT(MC_RSYSID_F0, 0.5f);
+
+/**
+ * Rate identification end frequency
+ *
+ * @unit Hz
+ * @min 1.0
+ * @max 12.0
+ * @decimal 2
+ * @group Multicopter Rate System Identification
+ */
+PARAM_DEFINE_FLOAT(MC_RSYSID_F1, 8.0f);
+
+/**
+ * Rate identification duration per axis
+ *
+ * @unit s
+ * @min 5.0
+ * @max 30.0
+ * @decimal 1
+ * @group Multicopter Rate System Identification
+ */
+PARAM_DEFINE_FLOAT(MC_RSYSID_T, 10.0f);
+
+/**
+ * Rate identification multisine repetitions
+ *
+ * Number of identical periods contained in MC_RSYSID_T. This parameter only
+ * affects torque multisine mode.
+ *
+ * @min 2
+ * @max 8
+ * @group Multicopter Rate System Identification
+ */
+PARAM_DEFINE_INT32(MC_RSYSID_REP, 3);
+
+/**
  * Multicopter rate controller mode
  *
  * Selects the low-level multicopter rate controller. The default keeps the
  * stock PX4 PID controller unchanged.
  *
+ * In Shadow mode (2) the stock PID controller still drives the vehicle exactly
+ * as in mode 0, but the INDI core is computed in parallel on the same rate
+ * setpoint and logged to indi_status WITHOUT ever being published to the
+ * actuators. Use it to record real angular-acceleration / actuator response
+ * during a normal PID hover (with props, RC Stabilized/Altitude, no offboard)
+ * before letting INDI take over. Shadow ignores MC_INDI_ONLY_OF.
+ *
  * @value 0 PID
  * @value 1 INDI
+ * @value 2 INDI shadow (PID flies, INDI only logged)
  * @min 0
- * @max 1
+ * @max 2
  * @group Multicopter INDI Control
  */
 PARAM_DEFINE_INT32(MC_INDI_MODE, 0);
@@ -662,17 +780,33 @@ PARAM_DEFINE_FLOAT(MC_INDI_SLEW_Z, 0.0f);
 /**
  * INDI actuator state source
  *
- * Selects the applied-torque estimate source. Output and RPM paths are reserved
- * for follow-up implementation; the command model is currently used as fallback.
+ * Selects the applied-actuation model. The legacy model uses J/TMAX and a
+ * first-order body-torque estimate. The dynamic B1/B2 model implements the
+ * command-domain equivalent of the paper's G1/G2 incremental inverse while
+ * retaining the PX4 control allocator and requiring no RPM telemetry.
  *
  * @value 0 First-order command model
- * @value 1 Actuator outputs, fallback to command model
- * @value 2 ESC RPM, fallback to command model
+ * @value 1 Timestamped dynamic B1/B2 command model
  * @min 0
- * @max 2
+ * @max 1
  * @group Multicopter INDI Control
  */
 PARAM_DEFINE_INT32(MC_INDI_ACT_SRC, 0);
+
+/**
+ * INDI controlled-axis mask
+ *
+ * Allows staged takeover while the stock PID continues to run in parallel.
+ * Bit 0 selects roll, bit 1 pitch, and bit 2 yaw.
+ *
+ * @bit 0 roll
+ * @bit 1 pitch
+ * @bit 2 yaw
+ * @min 0
+ * @max 7
+ * @group Multicopter INDI Control
+ */
+PARAM_DEFINE_INT32(MC_INDI_AXES, 7);
 
 /**
  * INDI actuator model time constant
@@ -686,6 +820,147 @@ PARAM_DEFINE_INT32(MC_INDI_ACT_SRC, 0);
  * @group Multicopter INDI Control
  */
 PARAM_DEFINE_FLOAT(MC_INDI_MOT_TC, 0.04f);
+
+/**
+ * INDI actuator pure delay
+ *
+ * Total command-to-actuation delay used by the no-RPM actuator state model.
+ * Command history is queried by gyro timestamp_sample, not task run time.
+ *
+ * @unit ms
+ * @min 0
+ * @max 50
+ * @decimal 1
+ * @group Multicopter INDI Control
+ */
+PARAM_DEFINE_FLOAT(MC_INDI_MOT_DLY, 5.0f);
+
+/**
+ * INDI B1 roll acceleration from roll command
+ * @unit rad/s^2
+ * @min -5000
+ * @max 5000
+ * @decimal 2
+ * @group Multicopter INDI Control
+ */
+PARAM_DEFINE_FLOAT(MC_INDI_B1_RR, 200.0f);
+
+/** INDI B1 roll acceleration from pitch command
+ * @unit rad/s^2
+ * @min -5000
+ * @max 5000
+ * @decimal 2
+ * @group Multicopter INDI Control
+ */
+PARAM_DEFINE_FLOAT(MC_INDI_B1_RP, 0.0f);
+
+/** INDI B1 roll acceleration from yaw command
+ * @unit rad/s^2
+ * @min -5000
+ * @max 5000
+ * @decimal 2
+ * @group Multicopter INDI Control
+ */
+PARAM_DEFINE_FLOAT(MC_INDI_B1_RY, 0.0f);
+
+/** INDI B1 pitch acceleration from roll command
+ * @unit rad/s^2
+ * @min -5000
+ * @max 5000
+ * @decimal 2
+ * @group Multicopter INDI Control
+ */
+PARAM_DEFINE_FLOAT(MC_INDI_B1_PR, 0.0f);
+
+/** INDI B1 pitch acceleration from pitch command
+ * @unit rad/s^2
+ * @min -5000
+ * @max 5000
+ * @decimal 2
+ * @group Multicopter INDI Control
+ */
+PARAM_DEFINE_FLOAT(MC_INDI_B1_PP, 150.0f);
+
+/** INDI B1 pitch acceleration from yaw command
+ * @unit rad/s^2
+ * @min -5000
+ * @max 5000
+ * @decimal 2
+ * @group Multicopter INDI Control
+ */
+PARAM_DEFINE_FLOAT(MC_INDI_B1_PY, 0.0f);
+
+/** INDI B1 yaw acceleration from roll command
+ * @unit rad/s^2
+ * @min -5000
+ * @max 5000
+ * @decimal 2
+ * @group Multicopter INDI Control
+ */
+PARAM_DEFINE_FLOAT(MC_INDI_B1_YR, 0.0f);
+
+/** INDI B1 yaw acceleration from pitch command
+ * @unit rad/s^2
+ * @min -5000
+ * @max 5000
+ * @decimal 2
+ * @group Multicopter INDI Control
+ */
+PARAM_DEFINE_FLOAT(MC_INDI_B1_YP, 0.0f);
+
+/** INDI B1 yaw acceleration from yaw command
+ * @unit rad/s^2
+ * @min -5000
+ * @max 5000
+ * @decimal 2
+ * @group Multicopter INDI Control
+ */
+PARAM_DEFINE_FLOAT(MC_INDI_B1_YY, 40.0f);
+
+/** INDI B2 yaw spin-up acceleration from roll command increment
+ * @unit rad/s^2
+ * @min -5000
+ * @max 5000
+ * @decimal 2
+ * @group Multicopter INDI Control
+ */
+PARAM_DEFINE_FLOAT(MC_INDI_B2_YR, 0.0f);
+
+/** INDI B2 yaw spin-up acceleration from pitch command increment
+ * @unit rad/s^2
+ * @min -5000
+ * @max 5000
+ * @decimal 2
+ * @group Multicopter INDI Control
+ */
+PARAM_DEFINE_FLOAT(MC_INDI_B2_YP, 0.0f);
+
+/**
+ * INDI B2 yaw spin-up acceleration from yaw command increment
+ *
+ * This is the command-domain equivalent of the paper's rotor angular-momentum
+ * G2 term. Zero reproduces the simplified model that can excite yaw.
+ *
+ * @unit rad/s^2
+ * @min -5000
+ * @max 5000
+ * @decimal 2
+ * @group Multicopter INDI Control
+ */
+PARAM_DEFINE_FLOAT(MC_INDI_B2_YY, 0.0f);
+
+/**
+ * INDI 25-50 Hz normalized command RMS limit
+ *
+ * Persistent band energy above this value latches an automatic PID fallback.
+ * Set to zero to disable this monitor.
+ *
+ * @min 0
+ * @max 1
+ * @decimal 3
+ * @group Multicopter INDI Control
+ */
+PARAM_DEFINE_FLOAT(MC_INDI_HF_LIM, 0.08f);
 
 /**
  * INDI compensation enable bitmask

@@ -33,9 +33,13 @@
 
 #pragma once
 
+#include "IndiActuatorModel.hpp"
+
 #include <lib/rate_control/rate_control.hpp>
+#include <lib/system_identification/signal_generator.hpp>
 #include <lib/geo/geo.h>
 #include <lib/mathlib/math/filter/AlphaFilter.hpp>
+#include <lib/mathlib/math/filter/LowPassFilter2p.hpp>
 #include <lib/matrix/matrix/math.hpp>
 #include <lib/perf/perf_counter.h>
 #include <px4_platform_common/defines.h>
@@ -49,6 +53,7 @@
 #include <uORB/Subscription.hpp>
 #include <uORB/SubscriptionCallback.hpp>
 #include <uORB/topics/actuator_controls_status.h>
+#include <uORB/topics/actuator_motors.h>
 #include <uORB/topics/battery_status.h>
 #include <uORB/topics/control_allocator_status.h>
 #include <uORB/topics/indi_setpoint.h>
@@ -57,6 +62,7 @@
 #include <uORB/topics/parameter_update.h>
 #include <uORB/topics/rate_ctrl_status.h>
 #include <uORB/topics/rate_ctrl_compensation.h>
+#include <uORB/topics/rate_sysid_status.h>
 #include <uORB/topics/vehicle_attitude.h>
 #include <uORB/topics/vehicle_angular_velocity.h>
 #include <uORB/topics/vehicle_control_mode.h>
@@ -99,7 +105,8 @@ private:
 					matrix::Vector3f &thrust_setpoint, matrix::Vector3f &angular_accel_ff,
 					matrix::Quatf &q_sp, matrix::Vector3f &accel_sp_consumed, float &heading_sp);
 	matrix::Vector3f attitudeRatesSetpoint(const matrix::Quatf &q, const matrix::Quatf &qd) const;
-	matrix::Vector3f updateIndiControl(const matrix::Vector3f &rates, const matrix::Vector3f &rates_setpoint,
+	matrix::Vector3f updateIndiControl(uint64_t timestamp_sample, const matrix::Vector3f &rates,
+					   const matrix::Vector3f &rates_setpoint,
 					   const matrix::Vector3f &angular_accel_raw, const matrix::Vector3f &angular_accel_ff,
 					   float dt, const matrix::Vector3f &unallocated_torque_norm, bool allocator_feedback_valid,
 					   uint8_t &flags, matrix::Vector3f &omega_dot_raw_used, matrix::Vector3f &omega_dot_f,
@@ -114,13 +121,31 @@ private:
 			       const matrix::Vector3f &thrust_sp, const matrix::Quatf &q_sp,
 			       const matrix::Vector3f &accel_sp, float heading_sp);
 	void resetIndiState(const matrix::Vector3f &angular_accel, const matrix::Vector3f &tau0);
+	bool solveIndiIncrement(const matrix::Vector3f &accel_error, int32_t axis_mask,
+				matrix::Vector3f &command_increment) const;
+	void updateIndiCommandHistory(bool allocator_feedback_valid);
+	void updateIndiFallback(const matrix::Vector3f &candidate, float dt, bool active, uint8_t &flags);
+	float rateSysidSignal(float elapsed, float duration, float &frequency) const;
+	matrix::Vector3f updateRateSysid(hrt_abstime timestamp_sample, const matrix::Vector3f &rates,
+					  const matrix::Vector3f &base_rate_sp, bool armed_rotary,
+					  bool allocator_feedback_valid);
+	void setRateSysidState(uint8_t state, hrt_abstime timestamp_sample);
+	void abortRateSysid(uint8_t reason, hrt_abstime timestamp_sample);
+	void publishRateSysidStatus(hrt_abstime timestamp_sample, const matrix::Vector3f &base_rate_sp,
+				    const matrix::Vector3f &rate_sp, const matrix::Vector3f &rates,
+				    const matrix::Vector3f &torque_sp_pid, const matrix::Vector3f &torque_sp);
+	float selectedRateSysidAux() const;
+	bool rateSysidRunning() const;
+	uint8_t rateSysidAxis() const;
 
 	RateControl _rate_control; ///< class for rate control calculations
 
 	uORB::Subscription _battery_status_sub{ORB_ID(battery_status)};
+	uORB::Subscription _actuator_motors_sub{ORB_ID(actuator_motors)};
 	uORB::Subscription _control_allocator_status_sub{ORB_ID(control_allocator_status)};
 	uORB::Subscription _indi_setpoint_sub{ORB_ID(indi_setpoint)};
 	uORB::Subscription _manual_control_setpoint_sub{ORB_ID(manual_control_setpoint)};
+	uORB::Subscription _rate_sysid_manual_sub{ORB_ID(manual_control_setpoint)};
 	uORB::Subscription _vehicle_control_mode_sub{ORB_ID(vehicle_control_mode)};
 	uORB::Subscription _rate_ctrl_compensation_sub{ORB_ID(rate_ctrl_compensation)};
 	uORB::Subscription _vehicle_attitude_sub{ORB_ID(vehicle_attitude)};
@@ -134,6 +159,7 @@ private:
 
 	uORB::Publication<actuator_controls_status_s>	_actuator_controls_status_pub{ORB_ID(actuator_controls_status_0)};
 	uORB::Publication<indi_status_s>	_indi_status_pub{ORB_ID(indi_status)};
+	uORB::Publication<rate_sysid_status_s> _rate_sysid_status_pub{ORB_ID(rate_sysid_status)};
 	uORB::PublicationMulti<rate_ctrl_status_s>	_controller_status_pub{ORB_ID(rate_ctrl_status)};
 	uORB::Publication<vehicle_rates_setpoint_s>	_vehicle_rates_setpoint_pub{ORB_ID(vehicle_rates_setpoint)};
 	uORB::Publication<vehicle_torque_setpoint_s>	_vehicle_torque_setpoint_pub;
@@ -143,6 +169,7 @@ private:
 	vehicle_status_s	_vehicle_status{};
 	vehicle_attitude_s	_vehicle_attitude{};
 	indi_setpoint_s		_indi_setpoint{};
+	actuator_motors_s	_actuator_motors{};
 	rate_ctrl_compensation_s _rate_ctrl_compensation{};
 	hrt_abstime _indi_setpoint_rx_time{0};
 	hrt_abstime _rate_ctrl_compensation_rx_time{0};
@@ -169,14 +196,45 @@ private:
 	matrix::Vector3f _indi_angular_accel_limit{};
 	matrix::Vector3f _indi_torque_norm_limit{};
 	matrix::Vector3f _indi_torque_slew_rate{};
+	matrix::Matrix3f _indi_b1{};
+	matrix::Matrix3f _indi_b2{};
+	matrix::Matrix3f _indi_bsum_inv{};
+	bool _indi_b_valid{false};
 	matrix::Vector3f _allocator_unallocated_torque{};
 	hrt_abstime _allocator_status_timestamp{0};
 
-	AlphaFilter<matrix::Vector3f> _indi_omega_dot_filter{};
-	AlphaFilter<matrix::Vector3f> _indi_tau0_filter{};
+	// INDI synchronized filters: second-order Butterworth (LowPassFilter2p) so the
+	// omega_dot / tau0 pair rolls off steeply above MC_INDI_FILT. The previous
+	// single-pole AlphaFilter passed too much of the ~40 Hz differentiation noise
+	// and let the inner loop self-excite into a limit cycle.
+	math::LowPassFilter2p<matrix::Vector3f> _indi_omega_dot_filter{};
+	math::LowPassFilter2p<matrix::Vector3f> _indi_tau0_filter{};
+	math::LowPassFilter2p<matrix::Vector3f> _indi_actuator_filter{};
+	math::LowPassFilter2p<matrix::Vector3f> _indi_hf_low_filter{};
+	math::LowPassFilter2p<matrix::Vector3f> _indi_hf_high_filter{};
+	// Cache the configured (sample_freq, cutoff) so we only call set_cutoff_frequency()
+	// when it actually changes. LowPassFilter2p::set_cutoff_frequency() clears the
+	// delay elements on every call, so calling it each loop iteration would wipe the
+	// filter state every sample and effectively disable the low-pass.
+	float _indi_filter_sample_freq{-1.f};
+	float _indi_filter_cutoff{-1.f};
+	float _indi_fs_smooth{-1.f};			///< slow-smoothed loop rate used to configure the biquads
+							///< (raw 1/dt jitters ~30% on this FC; configuring off the
+							///< instantaneous value would re-clear the delay lines nearly
+							///< every sample and silently degrade the 2nd-order filter to 1st)
+	matrix::Vector3f _indi_last_omega_dot_f{};	///< last omega_dot filter output (for bumpless re-priming)
+	matrix::Vector3f _indi_last_tau0_f{};		///< last tau0 filter output (for bumpless re-priming)
 	matrix::Vector3f _indi_tau0_model{};
 	matrix::Vector3f _indi_tau_phys_applied_prev{};
 	matrix::Vector3f _indi_tau_norm_prev{};
+	matrix::Vector3f _indi_actuator_state{};
+	matrix::Vector3f _indi_actuator_state_f{};
+	matrix::Vector3f _indi_command_increment_prev{};
+	matrix::Vector3f _indi_b2_accel{};
+	matrix::Vector3f _indi_hf_energy{};
+	matrix::Vector3f _indi_published_torque{};
+	uint64_t _indi_published_torque_timestamp{0};
+	IndiActuatorModel _indi_actuator_model{};
 	matrix::Vector3f _indi_rates_prev{};
 	matrix::Quatf _indi_last_q_sp{1.f, 0.f, 0.f, 0.f};
 	matrix::Vector3f _indi_last_accel_sp{};
@@ -184,6 +242,42 @@ private:
 	bool _indi_filters_initialized{false};
 	bool _indi_tau_norm_prev_valid{false};
 	bool _indi_rates_prev_valid{false};
+	bool _indi_published_torque_valid{false};
+	bool _indi_active_prev{false};
+	bool _indi_dynamic_model_ready{false};
+	bool _indi_fallback_latched{false};
+	uint8_t _indi_saturation_mask{0};
+	uint8_t _indi_fallback_reason{indi_status_s::FALLBACK_NONE};
+	hrt_abstime _indi_saturation_since{0};
+	hrt_abstime _indi_allocation_since{0};
+	hrt_abstime _indi_hf_since{0};
+	float _indi_sensor_dt{0.f};
+
+	manual_control_setpoint_s _rate_sysid_manual{};
+	matrix::Vector3f _rate_sysid_injection{};
+	matrix::Vector3f _rate_sysid_torque_injection{};
+	matrix::Vector3f _rate_sysid_pid_torque{};
+	matrix::Vector3f _rate_sysid_last_torque{};
+	matrix::Vector3f _rate_sysid_initial_body_z{0.f, 0.f, 1.f};
+	hrt_abstime _rate_sysid_state_start{0};
+	hrt_abstime _rate_sysid_status_last_pub{0};
+	hrt_abstime _rate_sysid_allocation_bad_since{0};
+	uint8_t _rate_sysid_state{rate_sysid_status_s::STATE_IDLE};
+	uint8_t _rate_sysid_abort_reason{rate_sysid_status_s::ABORT_NONE};
+	bool _rate_sysid_switch_ready{false};
+	bool _rate_sysid_offboard_at_start{false};
+	float _rate_sysid_frequency{0.f};
+
+	static constexpr float kRateSysidSettleTime{3.f};
+	static constexpr float kRateSysidPauseTime{2.f};
+	static constexpr float kRateSysidRampTime{0.75f};
+	static constexpr float kRateSysidMaxRate{1.f};
+	// Command error is only a final sanity guard. Actual body rate, torque,
+	// attitude and allocator limits below remain the primary safety guards.
+	static constexpr float kRateSysidMaxRateError{2.f};
+	static constexpr float kRateSysidMaxTorque{0.18f};
+	static constexpr float kRateSysidMaxUnallocatedTorque{0.05f};
+	static constexpr float kRateSysidMaxTiltDelta{0.21f};
 
 	float _energy_integration_time{0.0f};
 	float _control_energy[4] {};
@@ -219,6 +313,14 @@ private:
 		(ParamFloat<px4::params::MC_ACRO_SUPEXPOY>) _param_mc_acro_supexpoy,		/**< superexpo stick curve shape (yaw) */
 
 		(ParamBool<px4::params::MC_BAT_SCALE_EN>) _param_mc_bat_scale_en,
+		(ParamInt<px4::params::MC_RSYSID_AUX>) _param_mc_rsysid_aux,
+		(ParamInt<px4::params::MC_RSYSID_MODE>) _param_mc_rsysid_mode,
+		(ParamFloat<px4::params::MC_RSYSID_AMP>) _param_mc_rsysid_amp,
+		(ParamFloat<px4::params::MC_RSYSID_TAMP>) _param_mc_rsysid_tamp,
+		(ParamFloat<px4::params::MC_RSYSID_F0>) _param_mc_rsysid_f0,
+		(ParamFloat<px4::params::MC_RSYSID_F1>) _param_mc_rsysid_f1,
+		(ParamFloat<px4::params::MC_RSYSID_T>) _param_mc_rsysid_t,
+		(ParamInt<px4::params::MC_RSYSID_REP>) _param_mc_rsysid_rep,
 
 		(ParamInt<px4::params::MC_INDI_MODE>) _param_mc_indi_mode,
 		(ParamBool<px4::params::MC_INDI_ONLY_OF>) _param_mc_indi_only_of,
@@ -250,7 +352,22 @@ private:
 		(ParamFloat<px4::params::MC_INDI_SLEW_Y>) _param_mc_indi_slew_y,
 		(ParamFloat<px4::params::MC_INDI_SLEW_Z>) _param_mc_indi_slew_z,
 		(ParamInt<px4::params::MC_INDI_ACT_SRC>) _param_mc_indi_act_src,
+		(ParamInt<px4::params::MC_INDI_AXES>) _param_mc_indi_axes,
 		(ParamFloat<px4::params::MC_INDI_MOT_TC>) _param_mc_indi_mot_tc,
+		(ParamFloat<px4::params::MC_INDI_MOT_DLY>) _param_mc_indi_mot_dly,
+		(ParamFloat<px4::params::MC_INDI_B1_RR>) _param_mc_indi_b1_rr,
+		(ParamFloat<px4::params::MC_INDI_B1_RP>) _param_mc_indi_b1_rp,
+		(ParamFloat<px4::params::MC_INDI_B1_RY>) _param_mc_indi_b1_ry,
+		(ParamFloat<px4::params::MC_INDI_B1_PR>) _param_mc_indi_b1_pr,
+		(ParamFloat<px4::params::MC_INDI_B1_PP>) _param_mc_indi_b1_pp,
+		(ParamFloat<px4::params::MC_INDI_B1_PY>) _param_mc_indi_b1_py,
+		(ParamFloat<px4::params::MC_INDI_B1_YR>) _param_mc_indi_b1_yr,
+		(ParamFloat<px4::params::MC_INDI_B1_YP>) _param_mc_indi_b1_yp,
+		(ParamFloat<px4::params::MC_INDI_B1_YY>) _param_mc_indi_b1_yy,
+		(ParamFloat<px4::params::MC_INDI_B2_YR>) _param_mc_indi_b2_yr,
+		(ParamFloat<px4::params::MC_INDI_B2_YP>) _param_mc_indi_b2_yp,
+		(ParamFloat<px4::params::MC_INDI_B2_YY>) _param_mc_indi_b2_yy,
+		(ParamFloat<px4::params::MC_INDI_HF_LIM>) _param_mc_indi_hf_lim,
 		(ParamInt<px4::params::MC_INDI_COMP_EN>) _param_mc_indi_comp_en,
 		(ParamInt<px4::params::MC_INDI_COMP_TO>) _param_mc_indi_comp_to
 	)

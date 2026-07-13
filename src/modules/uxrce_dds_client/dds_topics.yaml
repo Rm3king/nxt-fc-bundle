@@ -37,6 +37,10 @@ publications:
     type: px4_msgs::msg::VehicleAngularVelocity
     rate_limit: 200.
 
+  - topic: /fmu/out/vehicle_acceleration
+    type: px4_msgs::msg::VehicleAcceleration
+    rate_limit: 200.
+
   - topic: /fmu/out/vehicle_land_detected
     type: px4_msgs::msg::VehicleLandDetected
     rate_limit: 10.

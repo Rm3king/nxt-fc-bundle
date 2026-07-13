@@ -37,11 +37,15 @@ px4_add_module(
 	COMPILE_FLAGS
 		${MAX_CUSTOM_OPT_LEVEL}
 	SRCS
+		IndiActuatorModel.hpp
 		MulticopterRateControl.cpp
 		MulticopterRateControl.hpp
 	DEPENDS
 		circuit_breaker
 		mathlib
 		RateControl
+		SystemIdentification
 		px4_work_queue
 	)
+
+px4_add_unit_gtest(SRC IndiActuatorModelTest.cpp)

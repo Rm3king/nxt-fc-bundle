@@ -106,6 +106,23 @@ MulticopterRateControl::parameters_updated()
 					   _param_mc_indi_tlim_z.get());
 	_indi_torque_slew_rate = Vector3f(_param_mc_indi_slew_x.get(), _param_mc_indi_slew_y.get(),
 					  _param_mc_indi_slew_z.get());
+
+	_indi_b1 = Matrix3f{};
+	_indi_b1(0, 0) = _param_mc_indi_b1_rr.get();
+	_indi_b1(0, 1) = _param_mc_indi_b1_rp.get();
+	_indi_b1(0, 2) = _param_mc_indi_b1_ry.get();
+	_indi_b1(1, 0) = _param_mc_indi_b1_pr.get();
+	_indi_b1(1, 1) = _param_mc_indi_b1_pp.get();
+	_indi_b1(1, 2) = _param_mc_indi_b1_py.get();
+	_indi_b1(2, 0) = _param_mc_indi_b1_yr.get();
+	_indi_b1(2, 1) = _param_mc_indi_b1_yp.get();
+	_indi_b1(2, 2) = _param_mc_indi_b1_yy.get();
+	_indi_b2 = Matrix3f{};
+	_indi_b2(2, 0) = _param_mc_indi_b2_yr.get();
+	_indi_b2(2, 1) = _param_mc_indi_b2_yp.get();
+	_indi_b2(2, 2) = _param_mc_indi_b2_yy.get();
+	const Matrix3f bsum = _indi_b1 + _indi_b2;
+	_indi_b_valid = matrix::inv(bsum, _indi_bsum_inv) && _indi_bsum_inv.isAllFinite();
 }
 
 void
@@ -114,12 +131,541 @@ MulticopterRateControl::resetIndiState(const Vector3f &angular_accel, const Vect
 	_indi_tau0_model = tau0;
 	_indi_tau_phys_applied_prev = tau0;
 	_indi_tau_norm_prev.zero();
+	_indi_command_increment_prev.zero();
 	_indi_rates_prev.zero();
+
+	// Make sure the biquad coefficients are valid before priming the delay lines.
+	// resetIndiState() can be called from the PID branch before updateIndiControl()
+	// has had a chance to set the cutoff for the current sample rate.
+	if (_indi_omega_dot_filter.get_sample_freq() < 1.f) {
+		const float cutoff = math::constrain(_param_mc_indi_filt.get(), 1.f, 400.f);
+		_indi_omega_dot_filter.set_cutoff_frequency(1000.f, cutoff);
+		_indi_tau0_filter.set_cutoff_frequency(1000.f, cutoff);
+		_indi_actuator_filter.set_cutoff_frequency(1000.f, cutoff);
+	}
+
 	_indi_omega_dot_filter.reset(angular_accel);
 	_indi_tau0_filter.reset(tau0);
+	_indi_actuator_filter.reset(_indi_actuator_state);
+	_indi_last_omega_dot_f = angular_accel;
+	_indi_last_tau0_f = tau0;
 	_indi_filters_initialized = true;
 	_indi_tau_norm_prev_valid = false;
 	_indi_rates_prev_valid = false;
+}
+
+bool
+MulticopterRateControl::solveIndiIncrement(const Vector3f &accel_error, int32_t axis_mask,
+		Vector3f &command_increment) const
+{
+	command_increment.zero();
+	int selected[3] {};
+	int count = 0;
+
+	for (int axis = 0; axis < 3; ++axis) {
+		if (axis_mask & (1 << axis)) {
+			selected[count++] = axis;
+		}
+	}
+
+	const Matrix3f bsum = _indi_b1 + _indi_b2;
+
+	if (count == 1) {
+		const int i = selected[0];
+		const float gain = bsum(i, i);
+
+		if (!PX4_ISFINITE(gain) || fabsf(gain) < 1e-4f) {
+			return false;
+		}
+
+		command_increment(i) = accel_error(i) / gain;
+
+	} else if (count == 2) {
+		const int i = selected[0];
+		const int j = selected[1];
+		const float determinant = bsum(i, i) * bsum(j, j) - bsum(i, j) * bsum(j, i);
+
+		if (!PX4_ISFINITE(determinant) || fabsf(determinant) < 1e-6f) {
+			return false;
+		}
+
+		command_increment(i) = (bsum(j, j) * accel_error(i) - bsum(i, j) * accel_error(j)) / determinant;
+		command_increment(j) = (-bsum(j, i) * accel_error(i) + bsum(i, i) * accel_error(j)) / determinant;
+
+	} else if (count == 3 && _indi_b_valid) {
+		command_increment = _indi_bsum_inv * accel_error;
+
+	} else {
+		return false;
+	}
+
+	return command_increment.isAllFinite();
+}
+
+void
+MulticopterRateControl::updateIndiCommandHistory(bool allocator_feedback_valid)
+{
+	if (!_indi_published_torque_valid) {
+		return;
+	}
+
+	Vector3f achieved = _indi_published_torque;
+
+	if (allocator_feedback_valid) {
+		for (int axis = 0; axis < 3; ++axis) {
+			const float unallocated = PX4_ISFINITE(_allocator_unallocated_torque(axis)) ?
+					  _allocator_unallocated_torque(axis) : 0.f;
+			achieved(axis) = math::constrain(achieved(axis) - unallocated, -1.f, 1.f);
+		}
+	}
+
+	_indi_actuator_model.push(_indi_published_torque_timestamp, achieved);
+	_indi_published_torque_valid = false;
+}
+
+void
+MulticopterRateControl::updateIndiFallback(const Vector3f &candidate, float dt, bool active, uint8_t &flags)
+{
+	const hrt_abstime now = hrt_absolute_time();
+	const float hf_limit = math::constrain(_param_mc_indi_hf_lim.get(), 0.f, 1.f);
+	const Vector3f hf_band = _indi_hf_high_filter.apply(candidate) - _indi_hf_low_filter.apply(candidate);
+	const float energy_alpha = math::constrain(dt / (0.1f + dt), 0.f, 1.f);
+	_indi_hf_energy += energy_alpha * (hf_band.emult(hf_band) - _indi_hf_energy);
+
+	const int32_t axis_mask = _param_mc_indi_axes.get() & 7;
+	float selected_hf_rms = 0.f;
+
+	for (int axis = 0; axis < 3; ++axis) {
+		if (axis_mask & (1 << axis)) {
+			selected_hf_rms = math::max(selected_hf_rms, sqrtf(math::max(_indi_hf_energy(axis), 0.f)));
+		}
+	}
+
+	const bool saturated = (_indi_saturation_mask & axis_mask) != 0;
+	const bool allocator_fresh = _allocator_status_timestamp != 0
+				     && hrt_elapsed_time(&_allocator_status_timestamp) < 50_ms;
+	bool allocation_bad = false;
+
+	if (allocator_fresh) {
+		for (int axis = 0; axis < 3; ++axis) {
+			allocation_bad |= (axis_mask & (1 << axis))
+					  && fabsf(_allocator_unallocated_torque(axis)) > kRateSysidMaxUnallocatedTorque;
+		}
+	}
+	const bool hf_bad = hf_limit > FLT_EPSILON && selected_hf_rms > hf_limit;
+
+	if (hf_bad) {
+		flags |= indi_status_s::FLAG_HF_ENERGY;
+	}
+
+	if (!active) {
+		_indi_saturation_since = 0;
+		_indi_allocation_since = 0;
+		_indi_hf_since = 0;
+		return;
+	}
+
+	auto update_persistence = [now](bool condition, hrt_abstime &since) {
+		if (condition) {
+			if (since == 0) {
+				since = now;
+			}
+
+		} else {
+			since = 0;
+		}
+	};
+
+	update_persistence(saturated, _indi_saturation_since);
+	update_persistence(allocation_bad, _indi_allocation_since);
+	update_persistence(hf_bad, _indi_hf_since);
+
+	if (_indi_fallback_latched) {
+		flags |= indi_status_s::FLAG_AUTO_FALLBACK | indi_status_s::FLAG_FALLBACK;
+		return;
+	}
+
+	if (flags & (indi_status_s::FLAG_MODEL_INVALID | indi_status_s::FLAG_ACTUATOR_STALE)) {
+		// Before the delayed command history spans MC_INDI_MOT_DLY, PID keeps
+		// flying while the actuator model warms up. A model loss after it has once
+		// been valid is a real runtime fault and is latched until reset.
+		if (_indi_dynamic_model_ready) {
+			_indi_fallback_reason = indi_status_s::FALLBACK_MODEL;
+			_indi_fallback_latched = true;
+		}
+
+	} else if (_indi_saturation_since != 0 && now - _indi_saturation_since > 100_ms) {
+		_indi_fallback_reason = indi_status_s::FALLBACK_SATURATION;
+		_indi_fallback_latched = true;
+
+	} else if (_indi_allocation_since != 0 && now - _indi_allocation_since > 50_ms) {
+		_indi_fallback_reason = indi_status_s::FALLBACK_ALLOCATION;
+		_indi_fallback_latched = true;
+
+	} else if (_indi_hf_since != 0 && now - _indi_hf_since > 100_ms) {
+		_indi_fallback_reason = indi_status_s::FALLBACK_HF_ENERGY;
+		_indi_fallback_latched = true;
+	}
+
+	if (_indi_fallback_latched) {
+		flags |= indi_status_s::FLAG_AUTO_FALLBACK | indi_status_s::FLAG_FALLBACK;
+	}
+}
+
+bool
+MulticopterRateControl::rateSysidRunning() const
+{
+	return _rate_sysid_state >= rate_sysid_status_s::STATE_SETTLE
+	       && _rate_sysid_state <= rate_sysid_status_s::STATE_YAW;
+}
+
+uint8_t
+MulticopterRateControl::rateSysidAxis() const
+{
+	switch (_rate_sysid_state) {
+	case rate_sysid_status_s::STATE_ROLL:
+		return rate_sysid_status_s::AXIS_ROLL;
+
+	case rate_sysid_status_s::STATE_PITCH:
+		return rate_sysid_status_s::AXIS_PITCH;
+
+	case rate_sysid_status_s::STATE_YAW:
+		return rate_sysid_status_s::AXIS_YAW;
+
+	default:
+		return rate_sysid_status_s::AXIS_NONE;
+	}
+}
+
+float
+MulticopterRateControl::selectedRateSysidAux() const
+{
+	switch (_param_mc_rsysid_aux.get()) {
+	case 1: return _rate_sysid_manual.aux1;
+	case 2: return _rate_sysid_manual.aux2;
+	case 3: return _rate_sysid_manual.aux3;
+	case 4: return _rate_sysid_manual.aux4;
+	case 5: return _rate_sysid_manual.aux5;
+	case 6: return _rate_sysid_manual.aux6;
+	default: return NAN;
+	}
+}
+
+void
+MulticopterRateControl::setRateSysidState(uint8_t state, hrt_abstime timestamp_sample)
+{
+	_rate_sysid_state = state;
+	_rate_sysid_state_start = timestamp_sample;
+	_rate_sysid_injection.zero();
+	_rate_sysid_torque_injection.zero();
+	_rate_sysid_frequency = 0.f;
+}
+
+void
+MulticopterRateControl::abortRateSysid(uint8_t reason, hrt_abstime timestamp_sample)
+{
+	if (rateSysidRunning()) {
+		PX4_WARN("rate sysid aborted (%u)", reason);
+	}
+
+	_rate_sysid_abort_reason = reason;
+	_rate_sysid_allocation_bad_since = 0;
+	setRateSysidState(rate_sysid_status_s::STATE_ABORT, timestamp_sample);
+}
+
+float
+MulticopterRateControl::rateSysidSignal(float elapsed, float duration, float &frequency) const
+{
+	const float f0 = math::constrain(_param_mc_rsysid_f0.get(), 0.2f, 5.f);
+	const float f1 = math::constrain(_param_mc_rsysid_f1.get(), math::max(f0, 1.f), 12.f);
+
+	if (_param_mc_rsysid_mode.get() != rate_sysid_status_s::EXCITATION_TORQUE_MULTISINE) {
+		frequency = f0 * powf(f1 / f0, elapsed / math::max(duration, 0.1f));
+		return signal_generator::getLogSineSweep(f0, f1, duration, elapsed);
+	}
+
+	static constexpr int kComponents{9};
+	const int repetitions = math::constrain(_param_mc_rsysid_rep.get(), int32_t{2}, int32_t{8});
+	const float period = math::max(duration / repetitions, 1.f);
+	const float period_time = fmodf(elapsed, period);
+	float sum = 0.f;
+
+	for (int component = 0; component < kComponents; ++component) {
+		const float fraction = static_cast<float>(component) / (kComponents - 1);
+		const float target_frequency = f0 * powf(f1 / f0, fraction);
+		const int bin = math::max(1, static_cast<int>(roundf(target_frequency * period)));
+		const float bin_frequency = bin / period;
+		const float phase = -M_PI_F * component * (component - 1) / kComponents;
+		sum += sinf(2.f * M_PI_F * bin_frequency * period_time + phase);
+	}
+
+	frequency = f1;
+	return math::constrain(sum / sqrtf(2.f * kComponents), -1.f, 1.f);
+}
+
+Vector3f
+MulticopterRateControl::updateRateSysid(hrt_abstime timestamp_sample, const Vector3f &rates,
+		const Vector3f &base_rate_sp, bool armed_rotary, bool allocator_feedback_valid)
+{
+	_rate_sysid_manual_sub.update(&_rate_sysid_manual);
+	_rate_sysid_injection.zero();
+	_rate_sysid_torque_injection.zero();
+	_rate_sysid_frequency = 0.f;
+
+	if (_param_mc_rsysid_aux.get() == 0) {
+		if (rateSysidRunning()) {
+			abortRateSysid(rate_sysid_status_s::ABORT_MODE, timestamp_sample);
+		}
+
+		_rate_sysid_switch_ready = false;
+		return _rate_sysid_injection;
+	}
+
+	const float aux = selectedRateSysidAux();
+	const bool rc_fresh = _rate_sysid_manual.valid
+			      && _rate_sysid_manual.data_source == manual_control_setpoint_s::SOURCE_RC
+			      && _rate_sysid_manual.timestamp != 0
+			      && hrt_elapsed_time(&_rate_sysid_manual.timestamp) < 500_ms;
+	const bool switch_low = rc_fresh && PX4_ISFINITE(aux) && aux < -0.5f;
+	const bool switch_high = rc_fresh && PX4_ISFINITE(aux) && aux > 0.5f;
+	const bool attitude_fresh = _vehicle_attitude.timestamp != 0
+				    && hrt_elapsed_time(&_vehicle_attitude.timestamp) < 100_ms
+				    && PX4_ISFINITE(_vehicle_attitude.q[0])
+				    && PX4_ISFINITE(_vehicle_attitude.q[1])
+				    && PX4_ISFINITE(_vehicle_attitude.q[2])
+				    && PX4_ISFINITE(_vehicle_attitude.q[3]);
+
+	if (switch_low) {
+		if (rateSysidRunning()) {
+			abortRateSysid(rate_sysid_status_s::ABORT_SWITCH, timestamp_sample);
+		}
+
+		_rate_sysid_switch_ready = true;
+		return _rate_sysid_injection;
+	}
+
+	if (!rateSysidRunning()) {
+		if (switch_high && _rate_sysid_switch_ready) {
+			_rate_sysid_switch_ready = false;
+
+			if (!rc_fresh) {
+				abortRateSysid(rate_sysid_status_s::ABORT_RC_LOSS, timestamp_sample);
+
+			} else if (_param_mc_indi_mode.get() != 0) {
+				abortRateSysid(rate_sysid_status_s::ABORT_NOT_PID, timestamp_sample);
+
+			} else if (!armed_rotary || _landed || _maybe_landed) {
+				abortRateSysid(rate_sysid_status_s::ABORT_NOT_FLYING, timestamp_sample);
+
+			} else if (!_vehicle_control_mode.flag_control_rates_enabled) {
+				abortRateSysid(rate_sysid_status_s::ABORT_MODE, timestamp_sample);
+
+			} else if (!attitude_fresh) {
+				abortRateSysid(rate_sysid_status_s::ABORT_ATTITUDE, timestamp_sample);
+
+			} else {
+				_rate_sysid_abort_reason = rate_sysid_status_s::ABORT_NONE;
+				_rate_sysid_offboard_at_start = _vehicle_control_mode.flag_control_offboard_enabled;
+				_rate_sysid_allocation_bad_since = 0;
+
+				_rate_sysid_initial_body_z = Dcmf{Quatf{_vehicle_attitude.q}}.col(2);
+
+				PX4_INFO("rate sysid started");
+				setRateSysidState(rate_sysid_status_s::STATE_SETTLE, timestamp_sample);
+			}
+		}
+
+		return _rate_sysid_injection;
+	}
+
+	if (!rc_fresh) {
+		abortRateSysid(rate_sysid_status_s::ABORT_RC_LOSS, timestamp_sample);
+		return _rate_sysid_injection;
+	}
+
+	if (!switch_high) {
+		abortRateSysid(rate_sysid_status_s::ABORT_SWITCH, timestamp_sample);
+		return _rate_sysid_injection;
+	}
+
+	if (_rate_sysid_manual.sticks_moving) {
+		abortRateSysid(rate_sysid_status_s::ABORT_STICK_INPUT, timestamp_sample);
+		return _rate_sysid_injection;
+	}
+
+	if (_param_mc_indi_mode.get() != 0) {
+		abortRateSysid(rate_sysid_status_s::ABORT_NOT_PID, timestamp_sample);
+		return _rate_sysid_injection;
+	}
+
+	if (!armed_rotary || _landed || _maybe_landed) {
+		abortRateSysid(rate_sysid_status_s::ABORT_NOT_FLYING, timestamp_sample);
+		return _rate_sysid_injection;
+	}
+
+	if (!_vehicle_control_mode.flag_control_rates_enabled
+	    || _vehicle_control_mode.flag_control_offboard_enabled != _rate_sysid_offboard_at_start) {
+		abortRateSysid(rate_sysid_status_s::ABORT_MODE, timestamp_sample);
+		return _rate_sysid_injection;
+	}
+
+	if (!attitude_fresh) {
+		abortRateSysid(rate_sysid_status_s::ABORT_ATTITUDE, timestamp_sample);
+		return _rate_sysid_injection;
+	}
+
+	if (rates.abs().max() > kRateSysidMaxRate) {
+		abortRateSysid(rate_sysid_status_s::ABORT_RATE, timestamp_sample);
+		return _rate_sysid_injection;
+	}
+
+	if (_rate_sysid_last_torque.abs().max() > kRateSysidMaxTorque) {
+		abortRateSysid(rate_sysid_status_s::ABORT_TORQUE, timestamp_sample);
+		return _rate_sysid_injection;
+	}
+
+	const Vector3f body_z = Dcmf{Quatf{_vehicle_attitude.q}}.col(2);
+	const float tilt_delta = acosf(math::constrain(body_z.dot(_rate_sysid_initial_body_z), -1.f, 1.f));
+
+	if (tilt_delta > kRateSysidMaxTiltDelta) {
+		abortRateSysid(rate_sysid_status_s::ABORT_ATTITUDE, timestamp_sample);
+		return _rate_sysid_injection;
+	}
+
+	if (allocator_feedback_valid && _allocator_unallocated_torque.abs().max() > kRateSysidMaxUnallocatedTorque) {
+		if (_rate_sysid_allocation_bad_since == 0) {
+			_rate_sysid_allocation_bad_since = timestamp_sample;
+
+		} else if (timestamp_sample - _rate_sysid_allocation_bad_since > 50_ms) {
+			abortRateSysid(rate_sysid_status_s::ABORT_ALLOCATION, timestamp_sample);
+			return _rate_sysid_injection;
+		}
+
+	} else {
+		_rate_sysid_allocation_bad_since = 0;
+	}
+
+	const float duration = math::constrain(_param_mc_rsysid_t.get(), 5.f, 30.f);
+	float elapsed = (timestamp_sample - _rate_sysid_state_start) * 1e-6f;
+
+	switch (_rate_sysid_state) {
+	case rate_sysid_status_s::STATE_SETTLE:
+		if (elapsed >= kRateSysidSettleTime) {
+			setRateSysidState(rate_sysid_status_s::STATE_ROLL, timestamp_sample);
+			elapsed = 0.f;
+		}
+
+		break;
+
+	case rate_sysid_status_s::STATE_ROLL:
+		if (elapsed >= duration) {
+			setRateSysidState(rate_sysid_status_s::STATE_ROLL_PAUSE, timestamp_sample);
+			elapsed = 0.f;
+		}
+
+		break;
+
+	case rate_sysid_status_s::STATE_ROLL_PAUSE:
+		if (elapsed >= kRateSysidPauseTime) {
+			setRateSysidState(rate_sysid_status_s::STATE_PITCH, timestamp_sample);
+			elapsed = 0.f;
+		}
+
+		break;
+
+	case rate_sysid_status_s::STATE_PITCH:
+		if (elapsed >= duration) {
+			setRateSysidState(rate_sysid_status_s::STATE_PITCH_PAUSE, timestamp_sample);
+			elapsed = 0.f;
+		}
+
+		break;
+
+	case rate_sysid_status_s::STATE_PITCH_PAUSE:
+		if (elapsed >= kRateSysidPauseTime) {
+			setRateSysidState(rate_sysid_status_s::STATE_YAW, timestamp_sample);
+			elapsed = 0.f;
+		}
+
+		break;
+
+	case rate_sysid_status_s::STATE_YAW:
+		if (elapsed >= duration) {
+			PX4_INFO("rate sysid complete");
+			setRateSysidState(rate_sysid_status_s::STATE_COMPLETE, timestamp_sample);
+			return _rate_sysid_injection;
+		}
+
+		break;
+
+	default:
+		return _rate_sysid_injection;
+	}
+
+	const uint8_t axis = rateSysidAxis();
+
+	if (axis != rate_sysid_status_s::AXIS_NONE) {
+		const float ramp_time = math::min(kRateSysidRampTime, 0.2f * duration);
+		const float ramp_in = math::constrain(elapsed / math::max(ramp_time, 0.1f), 0.f, 1.f);
+		const float ramp_out = math::constrain((duration - elapsed) / math::max(ramp_time, 0.1f), 0.f, 1.f);
+		const float envelope = 0.5f - 0.5f * cosf(M_PI_F * math::min(ramp_in, ramp_out));
+		const float signal = rateSysidSignal(elapsed, duration, _rate_sysid_frequency);
+		const int axis_index = static_cast<int>(axis) - 1;
+
+		if (_param_mc_rsysid_mode.get() == rate_sysid_status_s::EXCITATION_RATE_CHIRP) {
+			const float amplitude = math::constrain(_param_mc_rsysid_amp.get(), 0.01f, 0.3f);
+			_rate_sysid_injection(axis_index) = amplitude * envelope * signal;
+
+		} else {
+			const float amplitude = math::constrain(_param_mc_rsysid_tamp.get(), 0.001f, 0.1f);
+			_rate_sysid_torque_injection(axis_index) = amplitude * envelope * signal;
+		}
+	}
+
+	if ((base_rate_sp + _rate_sysid_injection - rates).abs().max() > kRateSysidMaxRateError) {
+		abortRateSysid(rate_sysid_status_s::ABORT_RATE_ERROR, timestamp_sample);
+	}
+
+	return _rate_sysid_injection;
+}
+
+void
+MulticopterRateControl::publishRateSysidStatus(hrt_abstime timestamp_sample, const Vector3f &base_rate_sp,
+		const Vector3f &rate_sp, const Vector3f &rates, const Vector3f &torque_sp_pid,
+		const Vector3f &torque_sp)
+{
+	const hrt_abstime now = hrt_absolute_time();
+
+	if (_rate_sysid_status_last_pub != 0 && now - _rate_sysid_status_last_pub < 4_ms) {
+		return;
+	}
+
+	_rate_sysid_status_last_pub = now;
+	rate_sysid_status_s status{};
+	status.timestamp = now;
+	status.timestamp_sample = timestamp_sample;
+	status.state = _rate_sysid_state;
+	status.axis = rateSysidAxis();
+	status.abort_reason = _rate_sysid_abort_reason;
+	status.active = rateSysidRunning();
+	status.excitation_mode = math::constrain(_param_mc_rsysid_mode.get(), int32_t{0}, int32_t{2});
+	status.elapsed_s = _rate_sysid_state_start == 0 ? 0.f : (timestamp_sample - _rate_sysid_state_start) * 1e-6f;
+	status.frequency_hz = _rate_sysid_frequency;
+
+	if (status.axis != rate_sysid_status_s::AXIS_NONE) {
+		const int axis = static_cast<int>(status.axis) - 1;
+		status.injection = status.excitation_mode == rate_sysid_status_s::EXCITATION_RATE_CHIRP ?
+				   _rate_sysid_injection(axis) : _rate_sysid_torque_injection(axis);
+	}
+
+	_rate_sysid_injection.copyTo(status.rate_injection);
+	_rate_sysid_torque_injection.copyTo(status.torque_injection);
+	base_rate_sp.copyTo(status.base_rate_sp);
+	rate_sp.copyTo(status.rate_sp);
+	rates.copyTo(status.measured_rate);
+	torque_sp_pid.copyTo(status.torque_sp_pid);
+	torque_sp.copyTo(status.torque_sp);
+	_rate_sysid_status_pub.publish(status);
 }
 
 Vector3f
@@ -259,16 +805,63 @@ MulticopterRateControl::updateAccelHeadingFrontend(const Quatf &q, Vector3f &rat
 }
 
 Vector3f
-MulticopterRateControl::updateIndiControl(const Vector3f &rates, const Vector3f &rates_setpoint,
+MulticopterRateControl::updateIndiControl(uint64_t timestamp_sample, const Vector3f &rates,
+		const Vector3f &rates_setpoint,
 		const Vector3f &angular_accel_raw, const Vector3f &angular_accel_ff, float dt,
 		const Vector3f &unallocated_torque_norm, bool allocator_feedback_valid, uint8_t &flags,
 		Vector3f &omega_dot_raw_used, Vector3f &omega_dot_f, Vector3f &nu, Vector3f &nu_comp,
 		Vector3f &tau0_f, Vector3f &tau_comp, Vector3f &tau_phys, Vector3f &tau_norm)
 {
-	const float sample_freq = 1.f / math::max(dt, 0.000125f);
+	_indi_saturation_mask = 0;
+	_indi_sensor_dt = dt;
+	const float sample_freq_raw = 1.f / math::max(dt, 0.000125f);
+
+	// The gyro timestamps on this FC jitter heavily (measured dt std ~30% of the
+	// mean), so 1/dt swings sample-to-sample by tens of percent. Configuring the
+	// biquads off that raw value would trip the "fs changed" test almost every
+	// iteration, and set_cutoff_frequency() clears the delay lines on every call —
+	// silently degrading the intended 2nd-order Butterworth back to ~1st order
+	// exactly during transients. Configure the filters off a slowly-smoothed loop
+	// rate instead; the biquad coefficients are insensitive to sub-ms dt jitter.
+	if (_indi_fs_smooth < 0.f) {
+		_indi_fs_smooth = sample_freq_raw;
+
+	} else {
+		_indi_fs_smooth += 0.01f * (sample_freq_raw - _indi_fs_smooth);
+	}
+
+	const float sample_freq = _indi_fs_smooth;
 	const float cutoff = math::constrain(_param_mc_indi_filt.get(), 1.f, sample_freq * 0.45f);
-	_indi_omega_dot_filter.setCutoffFreq(sample_freq, cutoff);
-	_indi_tau0_filter.setCutoffFreq(sample_freq, cutoff);
+
+	// Only reconfigure the biquads when the (smoothed) sample rate or cutoff
+	// meaningfully changes. This now fires only on genuine loop-rate drift or a
+	// runtime MC_INDI_FILT change, not on per-sample timestamp jitter.
+	const bool cutoff_changed = fabsf(cutoff - _indi_filter_cutoff) > 0.01f;
+	const bool fs_changed = _indi_filter_sample_freq < 0.f
+				|| fabsf(sample_freq - _indi_filter_sample_freq) > 0.05f * _indi_filter_sample_freq;
+
+	if (cutoff_changed || fs_changed) {
+		// Preserve the current filter outputs so the coefficient change is bumpless.
+		const Vector3f omega_dot_state = _indi_filters_initialized ? _indi_last_omega_dot_f : angular_accel_raw;
+		const Vector3f tau0_state = _indi_filters_initialized ? _indi_last_tau0_f : _indi_tau0_model;
+
+		_indi_omega_dot_filter.set_cutoff_frequency(sample_freq, cutoff);
+		_indi_tau0_filter.set_cutoff_frequency(sample_freq, cutoff);
+		_indi_actuator_filter.set_cutoff_frequency(sample_freq, cutoff);
+		_indi_hf_low_filter.set_cutoff_frequency(sample_freq, math::min(25.f, sample_freq * 0.2f));
+		_indi_hf_high_filter.set_cutoff_frequency(sample_freq, math::min(50.f, sample_freq * 0.4f));
+		_indi_filter_sample_freq = sample_freq;
+		_indi_filter_cutoff = cutoff;
+
+		if (_indi_filters_initialized) {
+			// set_cutoff_frequency() cleared the delay lines; re-prime from last output.
+			_indi_omega_dot_filter.reset(omega_dot_state);
+			_indi_tau0_filter.reset(tau0_state);
+			_indi_actuator_filter.reset(_indi_actuator_state_f);
+			_indi_hf_low_filter.reset(_indi_tau_norm_prev);
+			_indi_hf_high_filter.reset(_indi_tau_norm_prev);
+		}
+	}
 
 	if (_indi_tau_norm_prev_valid) {
 		Vector3f applied_tau_norm = _indi_tau_norm_prev;
@@ -277,15 +870,12 @@ MulticopterRateControl::updateIndiControl(const Vector3f &rates, const Vector3f 
 			for (int i = 0; i < 3; i++) {
 				const float unallocated = PX4_ISFINITE(unallocated_torque_norm(i)) ? unallocated_torque_norm(i) : 0.f;
 
-				if (fabsf(unallocated) > 1e-5f) {
-					flags |= indi_status_s::FLAG_SATURATED;
-				}
-
 				applied_tau_norm(i) -= unallocated;
 				const float constrained = math::constrain(applied_tau_norm(i), -1.f, 1.f);
 
 				if (fabsf(constrained - applied_tau_norm(i)) > 1e-5f) {
 					flags |= indi_status_s::FLAG_SATURATED;
+					_indi_saturation_mask |= 1u << i;
 				}
 
 				applied_tau_norm(i) = constrained;
@@ -295,9 +885,27 @@ MulticopterRateControl::updateIndiControl(const Vector3f &rates, const Vector3f 
 		_indi_tau_phys_applied_prev = applied_tau_norm.emult(_indi_torque_max);
 	}
 
+	const int32_t actuator_model = _param_mc_indi_act_src.get();
 	const float motor_tau = math::constrain(_param_mc_indi_mot_tc.get(), 0.001f, 0.5f);
-	const float motor_alpha = math::constrain(dt / (motor_tau + dt), 0.f, 1.f);
-	_indi_tau0_model += motor_alpha * (_indi_tau_phys_applied_prev - _indi_tau0_model);
+	bool dynamic_model_valid = false;
+
+	if (actuator_model == 1) {
+		const float motor_delay = math::constrain(_param_mc_indi_mot_dly.get(), 0.f, 50.f) * 1e-3f;
+		dynamic_model_valid = _indi_actuator_model.update(timestamp_sample, dt, motor_delay, motor_tau,
+				      _indi_actuator_state);
+		const uint64_t newest_command = _indi_actuator_model.newestTimestamp();
+
+		if (newest_command == 0 || timestamp_sample < newest_command || timestamp_sample - newest_command > 100_ms) {
+			dynamic_model_valid = false;
+			flags |= indi_status_s::FLAG_ACTUATOR_STALE;
+		}
+
+		_indi_tau0_model = _indi_actuator_state.emult(_indi_torque_max);
+
+	} else {
+		const float motor_alpha = math::constrain(dt / (motor_tau + dt), 0.f, 1.f);
+		_indi_tau0_model += motor_alpha * (_indi_tau_phys_applied_prev - _indi_tau0_model);
+	}
 
 	if (!_indi_filters_initialized) {
 		resetIndiState(angular_accel_raw, _indi_tau0_model);
@@ -319,8 +927,19 @@ MulticopterRateControl::updateIndiControl(const Vector3f &rates, const Vector3f 
 	_indi_rates_prev = rates;
 	_indi_rates_prev_valid = true;
 
-	omega_dot_f = _indi_omega_dot_filter.update(omega_dot_raw_used);
-	tau0_f = _indi_tau0_filter.update(_indi_tau0_model);
+	omega_dot_f = _indi_omega_dot_filter.apply(omega_dot_raw_used);
+
+	if (actuator_model == 1) {
+		_indi_actuator_state_f = _indi_actuator_filter.apply(_indi_actuator_state);
+		tau0_f = _indi_actuator_state_f.emult(_indi_torque_max);
+
+	} else {
+		tau0_f = _indi_tau0_filter.apply(_indi_tau0_model);
+		_indi_actuator_state = _indi_tau0_model.edivide(_indi_torque_max);
+		_indi_actuator_state_f = tau0_f.edivide(_indi_torque_max);
+	}
+	_indi_last_omega_dot_f = omega_dot_f;
+	_indi_last_tau0_f = tau0_f;
 
 	nu = _indi_rate_gain.emult(rates_setpoint - rates) + angular_accel_ff;
 
@@ -370,6 +989,7 @@ MulticopterRateControl::updateIndiControl(const Vector3f &rates, const Vector3f 
 
 		if (fabsf(nu_comp_limited - nu_comp(i)) > 1e-5f) {
 			flags |= indi_status_s::FLAG_SATURATED;
+			_indi_saturation_mask |= 1u << i;
 		}
 
 		nu_comp(i) = nu_comp_limited;
@@ -383,12 +1003,44 @@ MulticopterRateControl::updateIndiControl(const Vector3f &rates, const Vector3f 
 
 		if (fabsf(tau_comp_limited - tau_comp(i)) > 1e-5f) {
 			flags |= indi_status_s::FLAG_SATURATED;
+			_indi_saturation_mask |= 1u << i;
 		}
 
 		tau_comp(i) = tau_comp_limited;
 	}
 
-	tau_phys = tau0_f + _indi_inertia.emult(nu + nu_comp - omega_dot_f) + tau_comp;
+	Vector3f command_increment{};
+	const int32_t axis_mask = _param_mc_indi_axes.get() & 7;
+	const bool inverse_valid = actuator_model == 1
+				   && solveIndiIncrement(nu + nu_comp - omega_dot_f
+						   + _indi_b2 * _indi_command_increment_prev,
+						   axis_mask, command_increment);
+
+	if (actuator_model == 1 && dynamic_model_valid && inverse_valid) {
+		_indi_b2_accel = _indi_b2 * _indi_command_increment_prev;
+		tau_norm = _indi_actuator_state_f + command_increment;
+		_indi_dynamic_model_ready = true;
+
+		for (int axis = 0; axis < 3; ++axis) {
+			tau_norm(axis) += tau_comp(axis) / math::max(_indi_torque_max(axis), 0.0001f);
+		}
+
+		tau_phys = tau_norm.emult(_indi_torque_max);
+
+	} else if (actuator_model == 1) {
+		_indi_b2_accel.zero();
+
+		if (!inverse_valid) {
+			flags |= indi_status_s::FLAG_MODEL_INVALID;
+		}
+
+		tau_norm = _indi_tau_norm_prev_valid ? _indi_tau_norm_prev : Vector3f{};
+		tau_phys = tau_norm.emult(_indi_torque_max);
+
+	} else {
+		_indi_b2_accel.zero();
+		tau_phys = tau0_f + _indi_inertia.emult(nu + nu_comp - omega_dot_f) + tau_comp;
+	}
 
 	for (int i = 0; i < 3; i++) {
 		const float physical_limit = math::max(_indi_torque_max(i) * _indi_torque_norm_limit(i), 0.0001f);
@@ -396,6 +1048,7 @@ MulticopterRateControl::updateIndiControl(const Vector3f &rates, const Vector3f 
 
 		if (fabsf(tau_phys_limited - tau_phys(i)) > 1e-5f) {
 			flags |= indi_status_s::FLAG_SATURATED;
+			_indi_saturation_mask |= 1u << i;
 		}
 
 		tau_phys(i) = tau_phys_limited;
@@ -405,6 +1058,7 @@ MulticopterRateControl::updateIndiControl(const Vector3f &rates, const Vector3f 
 
 		if (fabsf(constrained - tau_norm(i)) > 1e-5f) {
 			flags |= indi_status_s::FLAG_SATURATED;
+			_indi_saturation_mask |= 1u << i;
 		}
 
 		tau_norm(i) = constrained;
@@ -422,6 +1076,7 @@ MulticopterRateControl::updateIndiControl(const Vector3f &rates, const Vector3f 
 
 				if (fabsf(limited - tau_norm(i)) > 1e-5f) {
 					flags |= indi_status_s::FLAG_SATURATED;
+					_indi_saturation_mask |= 1u << i;
 				}
 
 				tau_norm(i) = limited;
@@ -432,6 +1087,10 @@ MulticopterRateControl::updateIndiControl(const Vector3f &rates, const Vector3f 
 
 	_indi_tau_norm_prev = tau_norm;
 	_indi_tau_norm_prev_valid = true;
+
+	if (actuator_model == 1) {
+		_indi_command_increment_prev = tau_norm - _indi_actuator_state_f;
+	}
 
 	return tau_norm;
 }
@@ -445,7 +1104,7 @@ MulticopterRateControl::publishIndiStatus(uint64_t timestamp_sample, uint8_t mod
 {
 	const hrt_abstime now = hrt_absolute_time();
 
-	if (_indi_status_last_pub != 0 && now - _indi_status_last_pub < 10_ms) {
+	if (_indi_status_last_pub != 0 && now - _indi_status_last_pub < 4_ms) {
 		return;
 	}
 
@@ -457,6 +1116,9 @@ MulticopterRateControl::publishIndiStatus(uint64_t timestamp_sample, uint8_t mod
 	status.mode = mode;
 	status.setpoint_source = setpoint_source;
 	status.flags = flags;
+	status.fallback_reason = _indi_fallback_reason;
+	status.axis_mask = _param_mc_indi_axes.get() & 7;
+	status.actuator_model = math::constrain(_param_mc_indi_act_src.get(), int32_t{0}, int32_t{1});
 	omega_sp.copyTo(status.omega_sp);
 	omega.copyTo(status.omega);
 	omega_dot_raw.copyTo(status.omega_dot_raw);
@@ -468,6 +1130,17 @@ MulticopterRateControl::publishIndiStatus(uint64_t timestamp_sample, uint8_t mod
 	tau_comp.copyTo(status.tau_comp);
 	tau_phys.copyTo(status.tau_phys);
 	tau_norm.copyTo(status.tau_norm);
+	_indi_actuator_state.copyTo(status.actuator_state);
+	_indi_actuator_state_f.copyTo(status.actuator_state_f);
+	_indi_command_increment_prev.copyTo(status.command_increment);
+	_indi_b2_accel.copyTo(status.b2_accel);
+
+	for (int motor = 0; motor < 4; ++motor) {
+		status.motor_command[motor] = _actuator_motors.control[motor];
+	}
+
+	status.sensor_dt = _indi_sensor_dt;
+	status.filter_sample_rate = _indi_filter_sample_freq;
 	thrust_sp.copyTo(status.thrust_sp);
 	q_sp.copyTo(status.q_sp);
 	accel_sp.copyTo(status.accel_sp);
@@ -566,13 +1239,19 @@ MulticopterRateControl::Run()
 			_thrust_setpoint = Vector3f(vehicle_rates_setpoint.thrust_body);
 		}
 
-		const bool indi_requested = _param_mc_indi_mode.get() == 1;
+		const int32_t indi_mode = _param_mc_indi_mode.get();
+		const bool indi_shadow = indi_mode == 2;
+		// In shadow mode INDI is computed and logged but never drives the vehicle,
+		// so it does not need offboard and always "uses" the CTBR path (it simply
+		// reads the same _rates_setpoint the stock PID is about to act on).
+		const bool indi_requested = indi_mode == 1 || indi_shadow;
 		const bool indi_allowed = indi_requested
-					  && (!_param_mc_indi_only_of.get() || _vehicle_control_mode.flag_control_offboard_enabled);
+					  && (indi_shadow || !_param_mc_indi_only_of.get()
+					      || _vehicle_control_mode.flag_control_offboard_enabled);
 		bool use_indi = false;
 
 		if (indi_allowed) {
-			if (_param_mc_indi_sp_mode.get() == 0) {
+			if (!indi_shadow && _param_mc_indi_sp_mode.get() == 0) {
 				if (_vehicle_attitude.timestamp != 0) {
 					const Quatf q{_vehicle_attitude.q};
 
@@ -613,9 +1292,26 @@ MulticopterRateControl::Run()
 		// run the rate controller
 		if (_vehicle_control_mode.flag_control_rates_enabled) {
 
-			// reset integral if disarmed
-			if (!_vehicle_control_mode.flag_armed || _vehicle_status.vehicle_type != vehicle_status_s::VEHICLE_TYPE_ROTARY_WING) {
+			const bool armed_rotary = _vehicle_control_mode.flag_armed
+						  && _vehicle_status.vehicle_type == vehicle_status_s::VEHICLE_TYPE_ROTARY_WING;
+
+			if (!armed_rotary) {
 				_rate_control.resetIntegral();
+				_indi_actuator_model.reset();
+				_indi_published_torque_valid = false;
+				_indi_fallback_latched = false;
+				_indi_fallback_reason = indi_status_s::FALLBACK_NONE;
+				_indi_active_prev = false;
+				_indi_dynamic_model_ready = false;
+			}
+
+			if (indi_mode != 1) {
+				_indi_fallback_latched = false;
+				_indi_fallback_reason = indi_status_s::FALLBACK_NONE;
+			}
+
+			if (indi_mode == 0) {
+				_indi_dynamic_model_ready = false;
 			}
 
 			// update saturation status from control allocation feedback
@@ -644,6 +1340,14 @@ MulticopterRateControl::Run()
 
 			const bool allocator_feedback_valid = _allocator_status_timestamp != 0
 							      && hrt_elapsed_time(&_allocator_status_timestamp) < 50_ms;
+			updateIndiCommandHistory(allocator_feedback_valid);
+			_actuator_motors_sub.update(&_actuator_motors);
+
+			const Vector3f base_rate_sp{_rates_setpoint};
+			const Vector3f rate_sysid_injection = updateRateSysid(angular_velocity.timestamp_sample, rates,
+										 base_rate_sp, armed_rotary,
+										 allocator_feedback_valid);
+			const Vector3f rate_sp_for_control = base_rate_sp + rate_sysid_injection;
 
 			Vector3f omega_dot_raw_used{angular_accel};
 			Vector3f omega_dot_f{};
@@ -653,22 +1357,62 @@ MulticopterRateControl::Run()
 			Vector3f tau_comp{};
 			Vector3f tau_phys{};
 			Vector3f tau_norm{};
-			Vector3f att_control{};
-			const bool indi_active = use_indi && _vehicle_control_mode.flag_armed
-						 && _vehicle_status.vehicle_type == vehicle_status_s::VEHICLE_TYPE_ROTARY_WING;
+			Vector3f att_control_pid = _rate_control.update(rates, rate_sp_for_control, angular_accel, dt,
+								      _maybe_landed || _landed);
+			_rate_sysid_pid_torque = att_control_pid;
+			Vector3f att_control = att_control_pid + _rate_sysid_torque_injection;
 
-			if (indi_active) {
-				_rate_control.resetIntegral();
-				att_control = updateIndiControl(rates, _rates_setpoint, angular_accel, angular_accel_ff, dt,
-								_allocator_unallocated_torque, allocator_feedback_valid, indi_flags,
-								omega_dot_raw_used, omega_dot_f, nu, nu_comp, tau0_f, tau_comp,
-								tau_phys, tau_norm);
+			for (int axis = 0; axis < 3; ++axis) {
+				att_control(axis) = math::constrain(att_control(axis), -1.f, 1.f);
+			}
+
+			const bool indi_takeover_requested = use_indi && armed_rotary && !indi_shadow;
+			const bool indi_shadow_run = use_indi && armed_rotary && indi_shadow;
+			bool indi_driving = false;
+
+			if (indi_takeover_requested || indi_shadow_run) {
+				if (!_indi_tau_norm_prev_valid || (indi_takeover_requested && !_indi_active_prev)) {
+					_indi_tau_norm_prev = att_control_pid;
+					_indi_tau_norm_prev_valid = true;
+					_indi_tau_phys_applied_prev = att_control_pid.emult(_indi_torque_max);
+					_indi_command_increment_prev = att_control_pid - _indi_actuator_state_f;
+				}
+
+				const Vector3f indi_candidate = updateIndiControl(angular_velocity.timestamp_sample, rates,
+										   _rates_setpoint, angular_accel, angular_accel_ff, dt,
+										   _allocator_unallocated_torque, allocator_feedback_valid,
+										   indi_flags, omega_dot_raw_used, omega_dot_f, nu, nu_comp,
+										   tau0_f, tau_comp, tau_phys, tau_norm);
+				updateIndiFallback(indi_candidate, dt, indi_takeover_requested, indi_flags);
+
+				if (indi_takeover_requested && !_indi_fallback_latched
+				    && !(indi_flags & (indi_status_s::FLAG_MODEL_INVALID | indi_status_s::FLAG_ACTUATOR_STALE))) {
+					const int32_t axis_mask = _param_mc_indi_axes.get() & 7;
+
+					for (int axis = 0; axis < 3; ++axis) {
+						if (axis_mask & (1 << axis)) {
+							att_control(axis) = indi_candidate(axis);
+							indi_driving = true;
+						}
+					}
+				}
 
 			} else {
-				// run stock PID rate controller
-				att_control = _rate_control.update(rates, _rates_setpoint, angular_accel, dt, _maybe_landed || _landed);
 				tau_norm = att_control;
 			}
+
+			if (indi_takeover_requested && !indi_driving) {
+				indi_flags |= indi_status_s::FLAG_FALLBACK;
+			}
+
+			if (indi_driving) {
+				tau_norm = att_control;
+				tau_phys = tau_norm.emult(_indi_torque_max);
+				_indi_tau_norm_prev = tau_norm;
+				_indi_command_increment_prev = tau_norm - _indi_actuator_state_f;
+			}
+
+			_indi_active_prev = indi_driving;
 
 			// publish rate controller status
 			rate_ctrl_status_s rate_ctrl_status{};
@@ -687,7 +1431,7 @@ MulticopterRateControl::Run()
 
 			// Scale stock PID setpoints by battery status if enabled. INDI uses angular acceleration feedback to
 			// adapt to actuator effectiveness, so applying this extra scale would desynchronize tau0 feedback.
-			if (_param_mc_bat_scale_en.get() && !indi_active) {
+			if (_param_mc_bat_scale_en.get() && !indi_driving) {
 				if (_battery_status_sub.updated()) {
 					battery_status_s battery_status;
 
@@ -704,7 +1448,16 @@ MulticopterRateControl::Run()
 				}
 			}
 
-			if (!indi_active) {
+			_rate_sysid_last_torque = Vector3f(vehicle_torque_setpoint.xyz);
+			publishRateSysidStatus(angular_velocity.timestamp_sample, base_rate_sp, rate_sp_for_control, rates,
+						      _rate_sysid_pid_torque, _rate_sysid_last_torque);
+
+			// Keep INDI state primed from the PID output while PID is in charge so a
+			// later takeover is bumpless — but NOT in shadow mode: there the shadow
+			// updateIndiControl() call owns the INDI filters/tau0 and its tau_norm is
+			// what we want to log, so overwriting it with the PID torque here would
+			// both wipe the shadow state every sample and clobber the logged value.
+			if (!indi_driving && !indi_shadow_run) {
 				tau_norm = Vector3f(vehicle_torque_setpoint.xyz);
 				const Vector3f pid_tau0 = tau_norm.emult(_indi_torque_max);
 				resetIndiState(angular_accel, pid_tau0);
@@ -717,14 +1470,18 @@ MulticopterRateControl::Run()
 			vehicle_torque_setpoint.timestamp_sample = angular_velocity.timestamp_sample;
 			vehicle_torque_setpoint.timestamp = hrt_absolute_time();
 			_vehicle_torque_setpoint_pub.publish(vehicle_torque_setpoint);
+			_indi_published_torque = Vector3f(vehicle_torque_setpoint.xyz);
+			_indi_published_torque_timestamp = angular_velocity.timestamp_sample;
+			_indi_published_torque_valid = armed_rotary;
 
 			updateActuatorControlsStatus(vehicle_torque_setpoint, dt);
 
 			publishIndiStatus(angular_velocity.timestamp_sample,
-					  indi_active ? indi_status_s::MODE_INDI : indi_status_s::MODE_PID,
+					  indi_driving ? indi_status_s::MODE_INDI
+					  : (indi_shadow_run ? indi_status_s::MODE_SHADOW : indi_status_s::MODE_PID),
 					  indi_setpoint_source,
 					  indi_flags,
-					  _rates_setpoint,
+					  rate_sp_for_control,
 					  rates,
 					  omega_dot_raw_used,
 					  omega_dot_f,
@@ -739,6 +1496,12 @@ MulticopterRateControl::Run()
 					  indi_accel_sp,
 					  indi_heading_sp);
 
+		} else {
+			if (rateSysidRunning()) {
+				abortRateSysid(rate_sysid_status_s::ABORT_MODE, angular_velocity.timestamp_sample);
+				publishRateSysidStatus(angular_velocity.timestamp_sample, _rates_setpoint, _rates_setpoint, rates,
+							      _rate_sysid_pid_torque, _rate_sysid_last_torque);
+			}
 		}
 	}
 

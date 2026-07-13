@@ -178,6 +178,7 @@ set(msg_files
 	RadioStatus.msg
 	RateCtrlCompensation.msg
 	RateCtrlStatus.msg
+	RateSysidStatus.msg
 	RcChannels.msg
 	RcParameterMap.msg
 	RegisterExtComponentReply.msg

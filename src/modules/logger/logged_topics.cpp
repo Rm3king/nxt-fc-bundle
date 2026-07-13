@@ -79,6 +79,8 @@ void LoggedTopics::add_default_topics()
 	add_optional_topic("gripper");
 	add_optional_topic("heater_status");
 	add_topic("home_position");
+	add_topic("indi_setpoint");
+	add_topic("indi_status", 4);
 	add_topic("hover_thrust_estimate", 100);
 	add_topic("input_rc", 500);
 	add_optional_topic("internal_combustion_engine_status", 10);
@@ -145,6 +147,7 @@ void LoggedTopics::add_default_topics()
 	add_optional_topic_multi("airspeed_wind", 1000, 4);
 	add_optional_topic_multi("control_allocator_status", 200, 2);
 	add_optional_topic_multi("rate_ctrl_status", 200, 2);
+	add_topic("rate_sysid_status", 4);
 	add_optional_topic_multi("sensor_hygrometer", 500, 4);
 	add_optional_topic_multi("rpm", 200);
 	add_topic_multi("timesync_status", 1000, 3);
@@ -340,6 +343,9 @@ void LoggedTopics::add_system_identification_topics()
 	add_topic("vehicle_torque_setpoint");
 	add_topic("vehicle_acceleration");
 	add_topic("actuator_motors");
+	add_topic("indi_status");
+	add_topic("rate_sysid_status");
+	add_topic_multi("control_allocator_status", 0, 2);
 }
 
 void LoggedTopics::add_mavlink_tunnel()
