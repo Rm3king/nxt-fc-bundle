@@ -804,15 +804,80 @@ MulticopterRateControl::updateAccelHeadingFrontend(const Quatf &q, Vector3f &rat
 	return true;
 }
 
+void
+MulticopterRateControl::updateRateControlCompensation(uint8_t &flags, Vector3f &nu_comp,
+		Vector3f &tau_comp)
+{
+	nu_comp.zero();
+	tau_comp.zero();
+	_indi_saturation_mask = 0;
+
+	if (_rate_ctrl_compensation_sub.updated()) {
+		_rate_ctrl_compensation_sub.copy(&_rate_ctrl_compensation);
+		_rate_ctrl_compensation_rx_time = hrt_absolute_time();
+	}
+
+	const hrt_abstime now = hrt_absolute_time();
+	const uint64_t comp_timeout_us = (uint64_t)math::max(_param_mc_indi_comp_to.get(), (int32_t)5) * 1000ULL;
+	const bool comp_fresh = _rate_ctrl_compensation.valid && _rate_ctrl_compensation_rx_time != 0
+				&& now - _rate_ctrl_compensation_rx_time <= comp_timeout_us;
+
+	if (comp_fresh) {
+		const int32_t comp_enable = _param_mc_indi_comp_en.get();
+
+		if (comp_enable & 1) {
+			nu_comp = Vector3f(_rate_ctrl_compensation.angular_accel_comp);
+		}
+
+		if (comp_enable & 2) {
+			tau_comp = Vector3f(_rate_ctrl_compensation.torque_comp);
+		}
+
+	} else if (_param_mc_indi_comp_en.get() != 0) {
+		flags |= indi_status_s::FLAG_COMP_TIMEOUT;
+	}
+
+	for (int i = 0; i < 3; i++) {
+		if (!PX4_ISFINITE(nu_comp(i))) {
+			nu_comp(i) = 0.f;
+		}
+
+		if (!PX4_ISFINITE(tau_comp(i))) {
+			tau_comp(i) = 0.f;
+		}
+
+		const float nu_comp_limited = math::constrain(nu_comp(i), -_indi_angular_accel_limit(i),
+					    _indi_angular_accel_limit(i));
+
+		if (fabsf(nu_comp_limited - nu_comp(i)) > 1e-5f) {
+			flags |= indi_status_s::FLAG_SATURATED;
+			_indi_saturation_mask |= 1u << i;
+		}
+
+		nu_comp(i) = nu_comp_limited;
+
+		// The companion is the primary limiter. This high bound only rejects
+		// malformed input before conversion to normalized controller torque.
+		const float tau_comp_limit = 10.0f;
+		const float tau_comp_limited = math::constrain(tau_comp(i), -tau_comp_limit, tau_comp_limit);
+
+		if (fabsf(tau_comp_limited - tau_comp(i)) > 1e-5f) {
+			flags |= indi_status_s::FLAG_SATURATED;
+			_indi_saturation_mask |= 1u << i;
+		}
+
+		tau_comp(i) = tau_comp_limited;
+	}
+}
+
 Vector3f
 MulticopterRateControl::updateIndiControl(uint64_t timestamp_sample, const Vector3f &rates,
 		const Vector3f &rates_setpoint,
 		const Vector3f &angular_accel_raw, const Vector3f &angular_accel_ff, float dt,
 		const Vector3f &unallocated_torque_norm, bool allocator_feedback_valid, uint8_t &flags,
-		Vector3f &omega_dot_raw_used, Vector3f &omega_dot_f, Vector3f &nu, Vector3f &nu_comp,
-		Vector3f &tau0_f, Vector3f &tau_comp, Vector3f &tau_phys, Vector3f &tau_norm)
+		Vector3f &omega_dot_raw_used, Vector3f &omega_dot_f, Vector3f &nu, const Vector3f &nu_comp,
+		Vector3f &tau0_f, const Vector3f &tau_comp, Vector3f &tau_phys, Vector3f &tau_norm)
 {
-	_indi_saturation_mask = 0;
 	_indi_sensor_dt = dt;
 	const float sample_freq_raw = 1.f / math::max(dt, 0.000125f);
 
@@ -945,68 +1010,6 @@ MulticopterRateControl::updateIndiControl(uint64_t timestamp_sample, const Vecto
 
 	for (int i = 0; i < 3; i++) {
 		nu(i) = math::constrain(nu(i), -_indi_angular_accel_limit(i), _indi_angular_accel_limit(i));
-	}
-
-	nu_comp.zero();
-	tau_comp.zero();
-
-	if (_rate_ctrl_compensation_sub.updated()) {
-		_rate_ctrl_compensation_sub.copy(&_rate_ctrl_compensation);
-		_rate_ctrl_compensation_rx_time = hrt_absolute_time();
-	}
-
-	const hrt_abstime now = hrt_absolute_time();
-	const uint64_t comp_timeout_us = (uint64_t)math::max(_param_mc_indi_comp_to.get(), (int32_t)5) * 1000ULL;
-	const bool comp_fresh = _rate_ctrl_compensation.valid && _rate_ctrl_compensation_rx_time != 0
-				&& now - _rate_ctrl_compensation_rx_time <= comp_timeout_us;
-
-	if (comp_fresh) {
-		const int32_t comp_enable = _param_mc_indi_comp_en.get();
-
-		if (comp_enable & 1) {
-			nu_comp = Vector3f(_rate_ctrl_compensation.angular_accel_comp);
-		}
-
-		if (comp_enable & 2) {
-			tau_comp = Vector3f(_rate_ctrl_compensation.torque_comp);
-		}
-
-	} else if (_param_mc_indi_comp_en.get() != 0) {
-		flags |= indi_status_s::FLAG_COMP_TIMEOUT;
-	}
-
-	for (int i = 0; i < 3; i++) {
-		if (!PX4_ISFINITE(nu_comp(i))) {
-			nu_comp(i) = 0.f;
-		}
-
-		if (!PX4_ISFINITE(tau_comp(i))) {
-			tau_comp(i) = 0.f;
-		}
-
-		const float nu_comp_limited = math::constrain(nu_comp(i), -_indi_angular_accel_limit(i),
-					    _indi_angular_accel_limit(i));
-
-		if (fabsf(nu_comp_limited - nu_comp(i)) > 1e-5f) {
-			flags |= indi_status_s::FLAG_SATURATED;
-			_indi_saturation_mask |= 1u << i;
-		}
-
-		nu_comp(i) = nu_comp_limited;
-
-		// The compensation stream is already limited on the companion side.
-		// Keep PX4's own pre-limit deliberately high so it does not mask
-		// direction tests; the final normalized actuator limit below still
-		// protects the actual torque setpoint.
-		const float tau_comp_limit = 10.0f;
-		const float tau_comp_limited = math::constrain(tau_comp(i), -tau_comp_limit, tau_comp_limit);
-
-		if (fabsf(tau_comp_limited - tau_comp(i)) > 1e-5f) {
-			flags |= indi_status_s::FLAG_SATURATED;
-			_indi_saturation_mask |= 1u << i;
-		}
-
-		tau_comp(i) = tau_comp_limited;
 	}
 
 	Vector3f command_increment{};
@@ -1357,6 +1360,7 @@ MulticopterRateControl::Run()
 			Vector3f tau_comp{};
 			Vector3f tau_phys{};
 			Vector3f tau_norm{};
+			updateRateControlCompensation(indi_flags, nu_comp, tau_comp);
 			Vector3f att_control_pid = _rate_control.update(rates, rate_sp_for_control, angular_accel, dt,
 								      _maybe_landed || _landed);
 			_rate_sysid_pid_torque = att_control_pid;
@@ -1369,6 +1373,7 @@ MulticopterRateControl::Run()
 			const bool indi_takeover_requested = use_indi && armed_rotary && !indi_shadow;
 			const bool indi_shadow_run = use_indi && armed_rotary && indi_shadow;
 			bool indi_driving = false;
+			uint8_t indi_driving_mask = 0;
 
 			if (indi_takeover_requested || indi_shadow_run) {
 				if (!_indi_tau_norm_prev_valid || (indi_takeover_requested && !_indi_active_prev)) {
@@ -1392,9 +1397,11 @@ MulticopterRateControl::Run()
 					for (int axis = 0; axis < 3; ++axis) {
 						if (axis_mask & (1 << axis)) {
 							att_control(axis) = indi_candidate(axis);
-							indi_driving = true;
+							indi_driving_mask |= 1u << axis;
 						}
 					}
+
+					indi_driving = indi_driving_mask != 0;
 				}
 
 			} else {
@@ -1403,6 +1410,19 @@ MulticopterRateControl::Run()
 
 			if (indi_takeover_requested && !indi_driving) {
 				indi_flags |= indi_status_s::FLAG_FALLBACK;
+			}
+
+			// Physical torque feedforward is controller-independent. Apply it to
+			// every PID-driven axis, including pure PID mode, unselected hybrid
+			// axes, and axes returned to PID by an INDI safety fallback. INDI-driven
+			// axes already contain this term in updateIndiControl().
+			if (armed_rotary) {
+				for (int axis = 0; axis < 3; ++axis) {
+					if (!(indi_driving_mask & (1u << axis))) {
+						att_control(axis) += tau_comp(axis) / math::max(_indi_torque_max(axis), 0.0001f);
+						att_control(axis) = math::constrain(att_control(axis), -1.f, 1.f);
+					}
+				}
 			}
 
 			if (indi_driving) {

@@ -105,13 +105,16 @@ private:
 					matrix::Vector3f &thrust_setpoint, matrix::Vector3f &angular_accel_ff,
 					matrix::Quatf &q_sp, matrix::Vector3f &accel_sp_consumed, float &heading_sp);
 	matrix::Vector3f attitudeRatesSetpoint(const matrix::Quatf &q, const matrix::Quatf &qd) const;
+	void updateRateControlCompensation(uint8_t &flags, matrix::Vector3f &nu_comp,
+					   matrix::Vector3f &tau_comp);
 	matrix::Vector3f updateIndiControl(uint64_t timestamp_sample, const matrix::Vector3f &rates,
 					   const matrix::Vector3f &rates_setpoint,
 					   const matrix::Vector3f &angular_accel_raw, const matrix::Vector3f &angular_accel_ff,
 					   float dt, const matrix::Vector3f &unallocated_torque_norm, bool allocator_feedback_valid,
 					   uint8_t &flags, matrix::Vector3f &omega_dot_raw_used, matrix::Vector3f &omega_dot_f,
-					   matrix::Vector3f &nu, matrix::Vector3f &nu_comp, matrix::Vector3f &tau0_f,
-					   matrix::Vector3f &tau_comp, matrix::Vector3f &tau_phys, matrix::Vector3f &tau_norm);
+					   matrix::Vector3f &nu, const matrix::Vector3f &nu_comp, matrix::Vector3f &tau0_f,
+					   const matrix::Vector3f &tau_comp, matrix::Vector3f &tau_phys,
+					   matrix::Vector3f &tau_norm);
 	void publishIndiStatus(uint64_t timestamp_sample, uint8_t mode, uint8_t setpoint_source, uint8_t flags,
 			       const matrix::Vector3f &omega_sp, const matrix::Vector3f &omega,
 			       const matrix::Vector3f &omega_dot_raw, const matrix::Vector3f &omega_dot_f,

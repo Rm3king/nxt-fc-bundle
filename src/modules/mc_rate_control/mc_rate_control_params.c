@@ -963,10 +963,12 @@ PARAM_DEFINE_FLOAT(MC_INDI_B2_YY, 0.0f);
 PARAM_DEFINE_FLOAT(MC_INDI_HF_LIM, 0.08f);
 
 /**
- * INDI compensation enable bitmask
+ * Rate-controller compensation enable bitmask
  *
  * Bit 0 enables angular acceleration compensation, bit 1 enables physical
- * torque compensation.
+ * torque compensation. Angular acceleration compensation is used by INDI.
+ * Physical torque compensation is also added to stock PID axes, including
+ * axes returned to PID by an INDI fallback.
  *
  * @bit 0 angular acceleration compensation
  * @bit 1 torque compensation
@@ -977,7 +979,7 @@ PARAM_DEFINE_FLOAT(MC_INDI_HF_LIM, 0.08f);
 PARAM_DEFINE_INT32(MC_INDI_COMP_EN, 0);
 
 /**
- * INDI compensation timeout
+ * Rate-controller compensation timeout
  *
  * Timeout for the onboard compensation stream.
  *
