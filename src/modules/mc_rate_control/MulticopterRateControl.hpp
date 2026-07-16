@@ -34,6 +34,7 @@
 #pragma once
 
 #include "IndiActuatorModel.hpp"
+#include "IndiTakeoverGate.hpp"
 
 #include <lib/rate_control/rate_control.hpp>
 #include <lib/system_identification/signal_generator.hpp>
@@ -179,6 +180,8 @@ private:
 
 	bool _landed{true};
 	bool _maybe_landed{true};
+	bool _ground_contact{true};
+	IndiTakeoverGate _indi_takeover_gate{};
 
 	hrt_abstime _last_run{0};
 	hrt_abstime _indi_status_last_pub{0};

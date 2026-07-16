@@ -38,6 +38,7 @@ px4_add_module(
 		${MAX_CUSTOM_OPT_LEVEL}
 	SRCS
 		IndiActuatorModel.hpp
+		IndiTakeoverGate.hpp
 		MulticopterRateControl.cpp
 		MulticopterRateControl.hpp
 	DEPENDS
@@ -49,3 +50,4 @@ px4_add_module(
 	)
 
 px4_add_unit_gtest(SRC IndiActuatorModelTest.cpp)
+px4_add_unit_gtest(SRC IndiTakeoverGateTest.cpp)

@@ -1217,6 +1217,11 @@ MulticopterRateControl::Run()
 			if (_vehicle_land_detected_sub.copy(&vehicle_land_detected)) {
 				_landed = vehicle_land_detected.landed;
 				_maybe_landed = vehicle_land_detected.maybe_landed;
+				_ground_contact = vehicle_land_detected.ground_contact;
+
+				_indi_takeover_gate.update(vehicle_land_detected.timestamp != 0 ?
+							   vehicle_land_detected.timestamp : hrt_absolute_time(),
+						   _landed, _maybe_landed, _ground_contact);
 			}
 		}
 
@@ -1323,6 +1328,7 @@ MulticopterRateControl::Run()
 			if (!armed_rotary) {
 				_rate_control.resetIntegral();
 				_indi_actuator_model.reset();
+				_indi_takeover_gate.reset();
 				_indi_published_torque_valid = false;
 				_indi_fallback_latched = false;
 				_indi_fallback_reason = indi_status_s::FALLBACK_NONE;
@@ -1392,7 +1398,14 @@ MulticopterRateControl::Run()
 				att_control(axis) = math::constrain(att_control(axis), -1.f, 1.f);
 			}
 
-			const bool indi_takeover_requested = use_indi && armed_rotary && !indi_shadow;
+			// The command-domain effectiveness model is identified around airborne
+			// thrust. During motor spool-up it has no RPM feedback and cannot know
+			// that the same normalized torque command has much less authority. Keep
+			// the stock PID in charge until ground contact has been clear long enough
+			// for the motors and allocator to settle, then use the normal bumpless
+			// PID-seeded INDI transition. In-air mode changes pass this gate immediately.
+			const bool indi_airborne_ready = _indi_takeover_gate.ready(hrt_absolute_time());
+			const bool indi_takeover_requested = use_indi && armed_rotary && !indi_shadow && indi_airborne_ready;
 			const bool indi_shadow_run = use_indi && armed_rotary && indi_shadow;
 			bool indi_driving = false;
 			uint8_t indi_driving_mask = 0;
