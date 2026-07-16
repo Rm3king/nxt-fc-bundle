@@ -121,8 +121,6 @@ MulticopterRateControl::parameters_updated()
 	_indi_b2(2, 0) = _param_mc_indi_b2_yr.get();
 	_indi_b2(2, 1) = _param_mc_indi_b2_yp.get();
 	_indi_b2(2, 2) = _param_mc_indi_b2_yy.get();
-	const Matrix3f bsum = _indi_b1 + _indi_b2;
-	_indi_b_valid = matrix::inv(bsum, _indi_bsum_inv) && _indi_bsum_inv.isAllFinite();
 }
 
 void
@@ -132,6 +130,7 @@ MulticopterRateControl::resetIndiState(const Vector3f &angular_accel, const Vect
 	_indi_tau_phys_applied_prev = tau0;
 	_indi_tau_norm_prev.zero();
 	_indi_command_increment_prev.zero();
+	_indi_command_increment_dt_prev = 0.f;
 	_indi_rates_prev.zero();
 
 	// Make sure the biquad coefficients are valid before priming the delay lines.
@@ -155,8 +154,8 @@ MulticopterRateControl::resetIndiState(const Vector3f &angular_accel, const Vect
 }
 
 bool
-MulticopterRateControl::solveIndiIncrement(const Vector3f &accel_error, int32_t axis_mask,
-		Vector3f &command_increment) const
+MulticopterRateControl::solveIndiIncrement(const Vector3f &accel_error, const Matrix3f &b2_discrete,
+		int32_t axis_mask, Vector3f &command_increment) const
 {
 	command_increment.zero();
 	int selected[3] {};
@@ -168,7 +167,7 @@ MulticopterRateControl::solveIndiIncrement(const Vector3f &accel_error, int32_t 
 		}
 	}
 
-	const Matrix3f bsum = _indi_b1 + _indi_b2;
+	const Matrix3f bsum = _indi_b1 + b2_discrete;
 
 	if (count == 1) {
 		const int i = selected[0];
@@ -192,8 +191,14 @@ MulticopterRateControl::solveIndiIncrement(const Vector3f &accel_error, int32_t 
 		command_increment(i) = (bsum(j, j) * accel_error(i) - bsum(i, j) * accel_error(j)) / determinant;
 		command_increment(j) = (-bsum(j, i) * accel_error(i) + bsum(i, i) * accel_error(j)) / determinant;
 
-	} else if (count == 3 && _indi_b_valid) {
-		command_increment = _indi_bsum_inv * accel_error;
+	} else if (count == 3) {
+		Matrix3f bsum_inv{};
+
+		if (!matrix::inv(bsum, bsum_inv) || !bsum_inv.isAllFinite()) {
+			return false;
+		}
+
+		command_increment = bsum_inv * accel_error;
 
 	} else {
 		return false;
@@ -1014,13 +1019,29 @@ MulticopterRateControl::updateIndiControl(uint64_t timestamp_sample, const Vecto
 
 	Vector3f command_increment{};
 	const int32_t axis_mask = _param_mc_indi_axes.get() & 7;
-	const bool inverse_valid = actuator_model == 1
-				   && solveIndiIncrement(nu + nu_comp - omega_dot_f
-						   + _indi_b2 * _indi_command_increment_prev,
-						   axis_mask, command_increment);
+	const float command_dt = math::max(dt, 0.000125f);
+	bool g2_valid = _indi_b2.isAllFinite();
+
+	for (int row = 0; row < 3; ++row) {
+		for (int column = 0; column < 3; ++column) {
+			g2_valid &= fabsf(_indi_b2(row, column)) <= 100.f;
+		}
+	}
+
+	const Matrix3f b2_discrete = g2_valid ? _indi_b2 * (1.f / command_dt) : Matrix3f{};
+	Vector3f b2_previous_accel{};
+
+	if (g2_valid && _indi_command_increment_dt_prev > 0.f) {
+		b2_previous_accel = _indi_b2
+				    * (_indi_command_increment_prev * (1.f / _indi_command_increment_dt_prev));
+	}
+
+	const bool inverse_valid = actuator_model == 1 && g2_valid
+				   && solveIndiIncrement(nu + nu_comp - omega_dot_f + b2_previous_accel,
+						   b2_discrete, axis_mask, command_increment);
 
 	if (actuator_model == 1 && dynamic_model_valid && inverse_valid) {
-		_indi_b2_accel = _indi_b2 * _indi_command_increment_prev;
+		_indi_b2_accel = b2_previous_accel;
 		tau_norm = _indi_actuator_state_f + command_increment;
 		_indi_dynamic_model_ready = true;
 
@@ -1093,6 +1114,7 @@ MulticopterRateControl::updateIndiControl(uint64_t timestamp_sample, const Vecto
 
 	if (actuator_model == 1) {
 		_indi_command_increment_prev = tau_norm - _indi_actuator_state_f;
+		_indi_command_increment_dt_prev = command_dt;
 	}
 
 	return tau_norm;
@@ -1381,6 +1403,7 @@ MulticopterRateControl::Run()
 					_indi_tau_norm_prev_valid = true;
 					_indi_tau_phys_applied_prev = att_control_pid.emult(_indi_torque_max);
 					_indi_command_increment_prev = att_control_pid - _indi_actuator_state_f;
+					_indi_command_increment_dt_prev = dt;
 				}
 
 				const Vector3f indi_candidate = updateIndiControl(angular_velocity.timestamp_sample, rates,
@@ -1430,6 +1453,7 @@ MulticopterRateControl::Run()
 				tau_phys = tau_norm.emult(_indi_torque_max);
 				_indi_tau_norm_prev = tau_norm;
 				_indi_command_increment_prev = tau_norm - _indi_actuator_state_f;
+				_indi_command_increment_dt_prev = dt;
 			}
 
 			_indi_active_prev = indi_driving;

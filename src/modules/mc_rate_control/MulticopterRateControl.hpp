@@ -124,8 +124,8 @@ private:
 			       const matrix::Vector3f &thrust_sp, const matrix::Quatf &q_sp,
 			       const matrix::Vector3f &accel_sp, float heading_sp);
 	void resetIndiState(const matrix::Vector3f &angular_accel, const matrix::Vector3f &tau0);
-	bool solveIndiIncrement(const matrix::Vector3f &accel_error, int32_t axis_mask,
-				matrix::Vector3f &command_increment) const;
+	bool solveIndiIncrement(const matrix::Vector3f &accel_error, const matrix::Matrix3f &b2_discrete,
+				int32_t axis_mask, matrix::Vector3f &command_increment) const;
 	void updateIndiCommandHistory(bool allocator_feedback_valid);
 	void updateIndiFallback(const matrix::Vector3f &candidate, float dt, bool active, uint8_t &flags);
 	float rateSysidSignal(float elapsed, float duration, float &frequency) const;
@@ -200,9 +200,9 @@ private:
 	matrix::Vector3f _indi_torque_norm_limit{};
 	matrix::Vector3f _indi_torque_slew_rate{};
 	matrix::Matrix3f _indi_b1{};
+	// MC_INDI_B2_* stores the continuous G2 coefficient. It is converted to
+	// the discrete B2=G2/dt inside updateIndiControl() at the gyro loop rate.
 	matrix::Matrix3f _indi_b2{};
-	matrix::Matrix3f _indi_bsum_inv{};
-	bool _indi_b_valid{false};
 	matrix::Vector3f _allocator_unallocated_torque{};
 	hrt_abstime _allocator_status_timestamp{0};
 
@@ -233,6 +233,7 @@ private:
 	matrix::Vector3f _indi_actuator_state{};
 	matrix::Vector3f _indi_actuator_state_f{};
 	matrix::Vector3f _indi_command_increment_prev{};
+	float _indi_command_increment_dt_prev{0.f};
 	matrix::Vector3f _indi_b2_accel{};
 	matrix::Vector3f _indi_hf_energy{};
 	matrix::Vector3f _indi_published_torque{};

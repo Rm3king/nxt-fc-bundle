@@ -781,7 +781,7 @@ PARAM_DEFINE_FLOAT(MC_INDI_SLEW_Z, 0.0f);
  * INDI actuator state source
  *
  * Selects the applied-actuation model. The legacy model uses J/TMAX and a
- * first-order body-torque estimate. The dynamic B1/B2 model implements the
+ * first-order body-torque estimate. The dynamic B1/G2 model implements the
  * command-domain equivalent of the paper's G1/G2 incremental inverse while
  * retaining the PX4 control allocator and requiring no RPM telemetry.
  *
@@ -917,34 +917,44 @@ PARAM_DEFINE_FLOAT(MC_INDI_B1_YP, 0.0f);
  */
 PARAM_DEFINE_FLOAT(MC_INDI_B1_YY, 40.0f);
 
-/** INDI B2 yaw spin-up acceleration from roll command increment
- * @unit rad/s^2
- * @min -5000
- * @max 5000
- * @decimal 2
+/**
+ * INDI continuous G2 yaw spin-up coefficient from roll command rate
+ *
+ * The legacy B2 parameter name is retained for compatibility. The stored
+ * value is continuous-time G2 and is discretized as B2=G2/dt at runtime.
+ * @unit rad/s
+ * @min -100
+ * @max 100
+ * @decimal 5
  * @group Multicopter INDI Control
  */
 PARAM_DEFINE_FLOAT(MC_INDI_B2_YR, 0.0f);
 
-/** INDI B2 yaw spin-up acceleration from pitch command increment
- * @unit rad/s^2
- * @min -5000
- * @max 5000
- * @decimal 2
+/**
+ * INDI continuous G2 yaw spin-up coefficient from pitch command rate
+ *
+ * The legacy B2 parameter name is retained for compatibility. The stored
+ * value is continuous-time G2 and is discretized as B2=G2/dt at runtime.
+ * @unit rad/s
+ * @min -100
+ * @max 100
+ * @decimal 5
  * @group Multicopter INDI Control
  */
 PARAM_DEFINE_FLOAT(MC_INDI_B2_YP, 0.0f);
 
 /**
- * INDI B2 yaw spin-up acceleration from yaw command increment
+ * INDI continuous G2 yaw spin-up coefficient from yaw command rate
  *
  * This is the command-domain equivalent of the paper's rotor angular-momentum
- * G2 term. Zero reproduces the simplified model that can excite yaw.
+ * G2 term. The legacy B2 parameter name is retained for compatibility. The
+ * stored value is discretized as B2=G2/dt at runtime. Zero reproduces the
+ * simplified model that can excite yaw.
  *
- * @unit rad/s^2
- * @min -5000
- * @max 5000
- * @decimal 2
+ * @unit rad/s
+ * @min -100
+ * @max 100
+ * @decimal 5
  * @group Multicopter INDI Control
  */
 PARAM_DEFINE_FLOAT(MC_INDI_B2_YY, 0.0f);
